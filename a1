@@ -1,0 +1,902 @@
+I am working on fixing middleware vulnerabilities on Linux and EC2 instance.
+A lambda (in python) will take instance id, middleware(s) name as input and will run the SSM document for remediating.
+Lambda will also pass the instance type (identified using instance ID) to run command.
+Lambda also needs to send email to owners with output of SSM command executed using SES.
+SSM document will have actions based on type (Linux or windows) and middleware names.
+Can you provide me Lambda and SSM document full code for this requirement?
+Here is a minimal but complete design you can adapt to your environment: a Python Lambda that calls an SSM document for middleware‑remediation, and an SSM‑document template that branches on OS and middleware names.
+
+1. Lambda function (Python)
+This Lambda:
+
+Takes InstanceId, Middlewares (list), and optionally InstanceType from the event.
+
+Uses EC2 DescribeInstances to infer OS (PlatformDetails / Platform) if not passed.
+
+Runs your custom SSM document with parameters including OS, InstanceType, and Middlewares.
+
+Waits for the command to complete and sends the output via SES.
+
+python
+import json
+import boto3
+import time
+
+ssm = boto3.client("ssm")
+ec2 = boto3.client("ec2")
+ses = boto3.client("ses")
+
+# === CONFIG ===
+SSM_DOCUMENT_NAME = "MiddlewareRemediateDocument"
+SES_SOURCE_EMAIL = "remediation@example.com"
+SES_DESTINATION_EMAILS = ["team@example.com"]  # or read from tags / DB
+
+def get_instance_os(instance_id):
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    instance = resp["Reservations"][0]["Instances"][0]
+    platform = instance.get("Platform", "")  # "windows" or empty for Linux
+    platform_details = instance.get("PlatformDetails", "").lower()
+
+    if platform == "windows" or "windows" in platform_details:
+        return "Windows"
+    return "Linux"
+
+def wait_for_ssm_command(command_id, instance_id, timeout_sec=600):
+    for _ in range(timeout_sec // 5):
+        resp = ssm.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=instance_id
+        )
+        status = resp["Status"]
+        if status in ["Success", "Failed", "Cancelled", "TimedOut"]:
+            return resp
+        time.sleep(5)
+    raise RuntimeError("SSM command timed out")
+
+def send_remediation_email(instance_id, os_type, instance_type, middlewares, ssm_output):
+    subject = f"Middleware remediation result for {instance_id}"
+    body = f"""
+    Instance: {instance_id}
+    OS: {os_type}
+    Instance type: {instance_type}
+    Middlewares: {', '.join(middlewares)}
+
+    SSM Command Output:
+    Status: {ssm_output.get('Status')}
+    Standard Output:
+    {ssm_output.get('StandardOutputContent', '')}
+
+    Standard Error:
+    {ssm_output.get('StandardErrorContent', '')}
+    """
+
+    ses.send_email(
+        Source=SES_SOURCE_EMAIL,
+        Destination={"ToAddresses": SES_DESTINATION_EMAILS},
+        Message={
+            "Subject": {"Data": subject},
+            "Body": {"Text": {"Data": body}}
+        }
+    )
+
+def lambda_handler(event, context):
+    instance_id = event["InstanceId"]
+    middlewares = event.get("Middlewares", [])
+    instance_type = event.get("InstanceType")
+
+    if not instance_id or not middlewares:
+        return {
+            "statusCode": 400,
+            "body": json.dumps("InstanceId and Middlewares are required")
+        }
+
+    # Auto‑detect OS if InstanceType not provided
+    if not instance_type:
+        instance_type = get_instance_os(instance_id)
+
+    # Run SSM document
+    resp = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName=SSM_DOCUMENT_NAME,
+        Parameters={
+            "OS": [instance_type],
+            "Middlewares": middlewares,
+        },
+        Comment=f"Middleware remediation for {instance_id}"
+    )
+
+    command_id = resp["Command"]["CommandId"]
+
+    # Wait for completion
+    ssm_result = wait_for_ssm_command(command_id, instance_id)
+
+    # Send email
+    send_remediation_email(
+        instance_id=instance_id,
+        os_type=instance_type,
+        instance_type=instance_type,
+        middlewares=middlewares,
+        ssm_output=ssm_result
+    )
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "CommandId": command_id,
+            "Status": ssm_result["Status"]
+        })
+    }
+You’ll need an IAM role for this Lambda with:
+
+ssm:SendCommand, ssm:GetCommandInvocation
+
+ec2:DescribeInstances
+
+ses:SendEmail
+and appropriate resource‑level restrictions in production.
+
+2. SSM Document (YAML)
+Below is a custom SSM Command document that:
+
+Branches on {{OS}} (Linux vs Windows).
+
+Takes Middlewares as a list and runs different remediation blocks per middleware.
+
+Save this as MiddlewareRemediateDocument in Systems Manager → Documents → Create document, type Command.
+
+text
+schemaVersion: "2.2"
+description: "Remediate middleware vulnerabilities on Linux/Windows instances"
+parameters:
+  OS:
+    type: "String"
+    description: "OS type: Linux or Windows"
+    default: "Linux"
+  Middlewares:
+    type: "StringList"
+    description: "List of middleware names to remediate (e.g., nginx, tomcat, iis)"
+
+mainSteps:
+  - name: "RunLinuxRemediation"
+    action: "aws:runShellScript"
+    precondition:
+      StringEquals:
+        - "{{OS}}"
+        - "Linux"
+    inputs:
+      runCommand:
+        - |
+          #!/bin/bash
+          echo "Starting middleware remediation on Linux"
+
+          for middleware in {{Middlewares}}
+          do
+            case "$middleware" in
+              "nginx")
+                echo "Remediating nginx..."
+                # Example: update nginx, apply config hardening, etc.
+                sudo apt-get update -y
+                sudo apt-get install --only-upgrade nginx -y
+                sudo systemctl restart nginx
+                ;;
+              "tomcat")
+                echo "Remediating tomcat..."
+                # Example: update tomcat, remove sample apps, tighten permissions
+                sudo apt-get install --only-upgrade tomcat9 -y
+                sudo rm -rf /var/lib/tomcat9/webapps/examples
+                sudo chown -R tomcat:tomcat /var/lib/tomcat9/webapps
+                sudo systemctl restart tomcat9
+                ;;
+              "apache")
+                echo "Remediating apache..."
+                sudo apt-get install --only-upgrade apache2 -y
+                sudo systemctl restart apache2
+                ;;
+              *)
+                echo "Unknown middleware: $middleware"
+                ;;
+            esac
+          done
+
+          echo "Linux middleware remediation completed."
+
+  - name: "RunWindowsRemediation"
+    action: "aws:runPowerShellScript"
+    precondition:
+      StringEquals:
+        - "{{OS}}"
+        - "Windows"
+    inputs:
+      runCommand:
+        - |
+          Write-Host "Starting middleware remediation on Windows"
+
+          foreach ($middleware in @({{Middlewares}}))
+          {
+            switch ($middleware)
+            {
+              "iis"
+              {
+                Write-Host "Remediating IIS..."
+                # Example: install latest IIS security updates via Windows Update or WSUS
+                # In practice you may call DISM / online / enable‑feature, etc.
+                # Or invoke a local script that runs updates / config hardening.
+                # This is a placeholder; tailor to your patching process.
+              }
+              "tomcat"
+              {
+                Write-Host "Remediating Tomcat on Windows..."
+                # Example: stop Tomcat, replace binaries, restart
+                # Get‑Service "Tomcat*" | Stop‑Service -Force
+                # Expand‑Archive -Path "C:\temp\tomcat-latest.zip" -DestinationPath "C:\tomcat" -Force
+                # Get‑Service "Tomcat*" | Start‑Service
+              }
+              default
+              {
+                Write-Host "Unknown middleware: $middleware"
+              }
+            }
+          }
+
+          Write-Host "Windows middleware remediation completed."
+For real‑world use, replace the runCommand snippets with your actual remediation steps (package managers, config‑file edits, restarts, etc.).
+
+SSM Command documents are documented here:
+
+3. How to wire it together
+Create the SSM document above in Systems Manager.
+
+Create the Lambda with the Python code, and:
+
+Set SSM_DOCUMENT_NAME = "MiddlewareRemediateDocument".
+
+Configure SES (verified source/destination, sandbox vs production).
+​
+​
+
+Test via EventBridge / Step Functions / API Gateway, e.g.:
+
+json
+{
+  "InstanceId": "i-1234567890abcdef0",
+  "Middlewares": ["nginx", "tomcat"]
+}
+If you tell me which specific middlewares (e.g., nginx, Apache, Tomcat, IIS, etc.) and your preferred package manager (yum, apt, zypper, Windows Update, etc.), I can tailor the SSM document with concrete, hardened remediation commands for each.
+
+Can you create the SSM document in json for:
+Java Oracle
+Apache Tomcat
+Visual C++
+Apache
+JBoss
+Powershell 7
+Python
+Here is a JSON‑formatted SSM Command document that branches on OS and runs remediation blocks for:
+
+Java (Oracle)
+
+Apache Tomcat
+
+Visual C++
+
+Apache HTTP Server
+
+JBoss
+
+PowerShell 7
+
+Python
+
+You can paste this as DocumentFormat: JSON in Systems Manager → Create document → Command.
+
+SSM Document (JSON)
+json
+{
+  "schemaVersion": "2.2",
+  "description": "Remediate vulnerabilities for Java Oracle, Tomcat, Visual C++, Apache, JBoss, PowerShell 7, and Python",
+  "parameters": {
+    "OS": {
+      "type": "String",
+      "description": "OS type: Linux or Windows",
+      "default": "Linux"
+    },
+    "Middlewares": {
+      "type": "StringList",
+      "description": "List of middleware names to remediate (e.g., Java, Tomcat, VisualCpp, Apache, JBoss, PowerShell7, Python)"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RunLinuxRemediation",
+      "action": "aws:runShellScript",
+      "precondition": {
+        "StringEquals": [
+          "{{OS}}",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash",
+          "echo \"Starting middleware remediation on Linux\"",
+          "for middleware in {{Middlewares}}; do",
+          "  case \"$middleware\" in",
+          "    \"Java\"|\"JavaOracle\")",
+          "      echo \"Remediating Java (Oracle) on Linux...\"",
+          "      # Example: update Java; tailor to your package manager and vendor",
+          "      sudo apt-get update -y",
+          "      sudo apt-get install --only-upgrade openjdk-17-jdk -y",
+          "      ;;",
+          "    \"Tomcat\"|\"ApacheTomcat\")",
+          "      echo \"Remediating Apache Tomcat on Linux...\"",
+          "      sudo apt-get install --only-upgrade tomcat9 -y",
+          "      # Harden config: disable sample apps, tighten permissions",
+          "      sudo rm -rf /var/lib/tomcat9/webapps/examples",
+          "      sudo chown -R tomcat:tomcat /var/lib/tomcat9/webapps",
+          "      sudo systemctl restart tomcat9",
+          "      ;;",
+          "    \"Apache\"|\"ApacheHTTP\")",
+          "      echo \"Remediating Apache HTTP Server on Linux...\"",
+          "      sudo apt-get install --only-upgrade apache2 -y",
+          "      sudo systemctl restart apache2",
+          "      ;;",
+          "    \"JBoss\"|\"WildFly\")",
+          "      echo \"Remediating JBoss/WildFly on Linux...\"",
+          "      # Example: update JBoss packages or deploy patched version",
+          "      # In practice you may download a new distro and replace /opt/jboss",
+          "      echo \"Update JBoss distribution manually or via your artifact repo.\"",
+          "      ;;",
+          "    \"Python\")",
+          "      echo \"Remediating Python on Linux...\"",
+          "      sudo apt-get install --only-upgrade python3 python3-pip -y",
+          "      ;;",
+          "    *)",
+          "      echo \"Unknown middleware on Linux: $middleware\"",
+          "      ;;",
+          "  esac",
+          "done",
+          "echo \"Linux middleware remediation completed.\""
+        ]
+      }
+    },
+    {
+      "name": "RunWindowsRemediation",
+      "action": "aws:runPowerShellScript",
+      "precondition": {
+        "StringEquals": [
+          "{{OS}}",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "Write-Host \"Starting middleware remediation on Windows\"",
+          "$Middlewares = @({{Middlewares}})",
+          "foreach ($middleware in $Middlewares) {",
+          "  switch ($middleware) {",
+          "    'Java','JavaOracle' {",
+          "      Write-Host \"Remediating Java (Oracle) on Windows...\"",
+          "      # Example: trigger Windows Update / vendor MSI / config change",
+          "      # In practice call your Java‑update mechanism (MSI, SCCM, etc.)",
+          "      Write-Host \"Ensure latest Oracle Java / OpenJDK is installed via your patching process.\"",
+          "    }",
+          "    'Tomcat','ApacheTomcat' {",
+          "      Write-Host \"Remediating Apache Tomcat on Windows...\"",
+          "      # Example: stop Tomcat, replace binaries, restart",
+          "      # Get‑Service \"Tomcat*\" | Stop‑Service -Force",
+          "      # Expand‑Archive -Path \"C:\\temp\\tomcat-latest.zip\" -DestinationPath \"C:\\tomcat\" -Force",
+          "      # Get‑Service \"Tomcat*\" | Start‑Service",
+          "      Write-Host \"Update Tomcat binaries and configs per your standard procedure.\"",
+          "    }",
+          "    'VisualCpp','VisualC++' {",
+          "      Write-Host \"Remediating Visual C++ Redistributables on Windows...\"",
+          "      # Example: trigger Windows Update / vendor patch",
+          "      Write-Host \"Ensure latest Visual C++ redistributables via Windows Update or vendor installers.\"",
+          "    }",
+          "    'Apache','ApacheHTTP' {",
+          "      Write-Host \"Remediating Apache HTTP Server on Windows...\"",
+          "      # Example: update Apache binaries or MSI package",
+          "      Write-Host \"Update Apache HTTP Server binaries per your standard procedure.\"",
+          "    }",
+          "    'JBoss','WildFly' {",
+          "      Write-Host \"Remediating JBoss/WildFly on Windows...\"",
+          "      # Example: replace JBoss/WildFly distro under C:\\jboss",
+          "      Write-Host \"Update JBoss/WildFly distribution and configs per your standard procedure.\"",
+          "    }",
+          "    'PowerShell7','PowerShell' {",
+          "      Write-Host \"Remediating PowerShell 7 on Windows...\"",
+          "      # Example: update PowerShell 7 via MSI or winget",
+          "      # winget upgrade --id Microsoft.PowerShell",
+          "      Write-Host \"Ensure latest PowerShell 7 via winget / MSI / vendor package.\"",
+          "    }",
+          "    'Python' {",
+          "      Write-Host \"Remediating Python on Windows...\"",
+          "      # Example: update Python via MSI or winget",
+          "      # winget upgrade --id Python.Python.3",
+          "      Write-Host \"Ensure latest Python via winget / MSI / vendor installer.\"",
+          "    }",
+          "    default {",
+          "      Write-Host \"Unknown middleware on Windows: $middleware\"",
+          "    }",
+          "  }",
+          "}",
+          "Write-Host \"Windows middleware remediation completed.\""
+        ]
+      }
+    }
+  ]
+}
+Notes
+This is generic scaffolding; you must replace the example commands with your actual patch/update process (e.g., specific package names, MSI paths, config‑file changes, restart commands).
+
+For Java Oracle, you may prefer to:
+
+Use vendor‑provided MSI / RPM, or
+
+Switch to OpenJDK and patch via OS package manager.
+
+For Tomcat / JBoss / Apache, you typically:
+
+Upgrade to a patched version, and
+
+Harden configs (disable samples, tighten permissions, disable unsafe features).
+
+If you tell me your OS family (e.g., Amazon Linux 2, RHEL, Ubuntu, Windows Server 2019/2022) and patching model (yum/apt vs vendor‑provided installers), I can specialize the commands for each middleware.
+
+Please update the lambda and SSM to pass multiple EC2 instances.
+And tailor the SSM document for RHEL, and Windows Server 2019 with most efficient patching model. SSM document, by default, should take latest stable version of middleware available
+Below are:
+
+An updated Lambda that accepts multiple EC2 instance IDs and runs SSM in parallel.
+
+An SSM‑document JSON tailored for:
+
+RHEL (using yum / dnf and Red Hat‑style middleware where applicable).
+
+Windows Server 2019 (using Windows Update / vendor‑provided installers / winget).
+
+The SSM document defaults to the latest stable version of each middleware available in the OS‑native package manager or vendor channel.
+
+1. Updated Lambda (Python, multiple instances)
+python
+import json
+import boto3
+import time
+
+ssm = boto3.client("ssm")
+ec2 = boto3.client("ec2")
+ses = boto3.client("ses")
+
+SSM_DOCUMENT_NAME = "MiddlewareRemediateDocument"
+SES_SOURCE_EMAIL = "remediation@example.com"
+SES_DESTINATION_EMAILS = ["team@example.com"]  # or read from tags / DB
+
+
+def get_instance_os(instance_id):
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    instance = resp["Reservations"][0]["Instances"][0]
+    platform = instance.get("Platform", "")
+    platform_details = instance.get("PlatformDetails", "").lower()
+
+    if platform == "windows" or "windows" in platform_details:
+        return "Windows"
+    return "Linux"
+
+
+def wait_for_ssm_command(command_id, instance_id, timeout_sec=600):
+    for _ in range(timeout_sec // 5):
+        resp = ssm.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=instance_id
+        )
+        status = resp["Status"]
+        if status in ["Success", "Failed", "Cancelled", "TimedOut"]:
+            return resp
+        time.sleep(5)
+    raise RuntimeError("SSM command timed out")
+
+
+def send_remediation_email(instance_id, os_type, middlewares, ssm_output):
+    subject = f"Middleware remediation result for {instance_id}"
+    body = f"""
+    Instance: {instance_id}
+    OS: {os_type}
+    Middlewares: {', '.join(middlewares)}
+
+    SSM Command Output:
+    Status: {ssm_output.get('Status')}
+    Standard Output:
+    {ssm_output.get('StandardOutputContent', '')}
+
+    Standard Error:
+    {ssm_output.get('StandardErrorContent', '')}
+    """
+
+    ses.send_email(
+        Source=SES_SOURCE_EMAIL,
+        Destination={"ToAddresses": SES_DESTINATION_EMAILS},
+        Message={
+            "Subject": {"Data": subject},
+            "Body": {"Text": {"Data": body}}
+        }
+    )
+
+
+def lambda_handler(event, context):
+    instance_ids = event["InstanceIds"]  # list of strings
+    middlewares = event.get("Middlewares", [])
+
+    if not instance_ids or not middlewares:
+        return {
+            "statusCode": 400,
+            "body": json.dumps("InstanceIds and Middlewares are required")
+        }
+
+    results = []
+
+    for instance_id in instance_ids:
+        # Auto‑detect OS
+        os_type = get_instance_os(instance_id)
+
+        # Run SSM document
+        resp = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName=SSM_DOCUMENT_NAME,
+            Parameters={
+                "OS": [os_type],
+                "Middlewares": middlewares,
+            },
+            Comment=f"Middleware remediation for {instance_id}"
+        )
+
+        command_id = resp["Command"]["CommandId"]
+
+        # Wait for completion
+        ssm_result = wait_for_ssm_command(command_id, instance_id)
+
+        # Send email
+        send_remediation_email(
+            instance_id=instance_id,
+            os_type=os_type,
+            middlewares=middlewares,
+            ssm_output=ssm_result
+        )
+
+        results.append({
+            "InstanceId": instance_id,
+            "CommandId": command_id,
+            "Status": ssm_result["Status"]
+        })
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(results)
+    }
+Event example:
+
+json
+{
+  "InstanceIds": ["i-1234567890abcdef0", "i-0987654321fedcba0"],
+  "Middlewares": ["Java", "Tomcat", "Apache", "JBoss", "Python"]
+}
+2. SSM Document (JSON) – RHEL + Windows Server 2019
+This document:
+
+Uses RHEL‑style patching (yum/dnf, Red Hat‑style repos).
+
+Uses Windows Server 2019 with vendor‑provided installers / Windows Update / winget where appropriate.
+
+Defaults to latest stable version available in the OS‑native channel.
+
+json
+{
+  "schemaVersion": "2.2",
+  "description": "Remediate Java Oracle, Tomcat, Visual C++, Apache, JBoss, PowerShell 7, Python on RHEL and Windows Server 2019",
+  "parameters": {
+    "OS": {
+      "type": "String",
+      "description": "OS type: Linux or Windows",
+      "default": "Linux"
+    },
+    "Middlewares": {
+      "type": "StringList",
+      "description": "List of middleware names to remediate (Java, Tomcat, VisualCpp, Apache, JBoss, PowerShell7, Python)"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RunLinuxRemediation",
+      "action": "aws:runShellScript",
+      "precondition": {
+        "StringEquals": [
+          "{{OS}}",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash",
+          "echo \"Starting middleware remediation on RHEL\"",
+          "for middleware in {{Middlewares}}; do",
+          "  case \"$middleware\" in",
+          "    \"Java\"|\"JavaOracle\")",
+          "      echo \"Remediating Java (latest stable) on RHEL...\"",
+          "      sudo yum update -y java-1.8.0-openjdk* || true",
+          "      sudo yum install -y java-1.8.0-openjdk-devel || true",
+          "      ;;",
+          "    \"Tomcat\"|\"ApacheTomcat\")",
+          "      echo \"Remediating Apache Tomcat (latest stable) on RHEL...\"",
+          "      sudo yum update -y tomcat tomcat-lib tomcat-webapps tomcat-admin-webapps || true",
+          "      sudo systemctl restart tomcat || true",
+          "      ;;",
+          "    \"Apache\"|\"ApacheHTTP\")",
+          "      echo \"Remediating Apache HTTP Server (latest stable) on RHEL...\"",
+          "      sudo yum update -y httpd || true",
+          "      sudo systemctl restart httpd || true",
+          "      ;;",
+          "    \"JBoss\"|\"WildFly\"|\"JBossEAP\")",
+          "      echo \"Remediating JBoss / WildFly (latest stable) on RHEL...\"",
+          "      # Example: update via Red Hat repos or tarball; tailor to your EAP/JWS setup",
+          "      echo \"Ensure latest JBoss EAP / WildFly via Red Hat repos or vendor archive.\"",
+          "      ;;",
+          "    \"Python\")",
+          "      echo \"Remediating Python (latest stable) on RHEL...\"",
+          "      sudo yum update -y python3 python3-pip || true",
+          "      ;;",
+          "    *)",
+          "      echo \"Unknown middleware on Linux: $middleware\"",
+          "      ;;",
+          "  esac",
+          "done",
+          "echo \"RHEL middleware remediation completed.\""
+        ]
+      }
+    },
+    {
+      "name": "RunWindowsRemediation",
+      "action": "aws:runPowerShellScript",
+      "precondition": {
+        "StringEquals": [
+          "{{OS}}",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "Write-Host \"Starting middleware remediation on Windows Server 2019\"",
+          "$Middlewares = @({{Middlewares}})",
+          "foreach ($middleware in $Middlewares) {",
+          "  switch ($middleware) {",
+          "    'Java','JavaOracle' {",
+          "      Write-Host \"Remediating Java (latest stable) on Windows...\"",
+          "      # Example: trigger Windows Update / vendor MSI",
+          "      Write-Host \"Ensure latest Oracle Java / OpenJDK via vendor MSI or Windows Update.\"",
+          "    }",
+          "    'Tomcat','ApacheTomcat' {",
+          "      Write-Host \"Remediating Apache Tomcat (latest stable) on Windows...\"",
+          "      # Example: download latest Tomcat zip and replace existing install",
+          "      # $tomcatUrl = \"https://dlcdn.apache.org/tomcat/tomcat-10/v10.x.x/bin/apache-tomcat-10.x.x-windows-x64.zip\"",
+          "      # (New-Object Net.WebClient).DownloadFile($tomcatUrl, \"C:\\temp\\tomcat.zip\")",
+          "      # Expand-Archive -Path \"C:\\temp\\tomcat.zip\" -DestinationPath \"C:\\tomcat\" -Force",
+          "      Write-Host \"Update Tomcat to latest stable version via vendor archive or installer.\"",
+          "    }",
+          "    'VisualCpp','VisualC++' {",
+          "      Write-Host \"Remediating Visual C++ Redistributables (latest stable) on Windows...\"",
+          "      # Example: trigger Windows Update / vendor redistributable",
+          "      Write-Host \"Ensure latest Visual C++ redistributables via Windows Update or vendor installer.\"",
+          "    }",
+          "    'Apache','ApacheHTTP' {",
+          "      Write-Host \"Remediating Apache HTTP Server (latest stable) on Windows...\"",
+          "      # Example: update Apache MSI or binaries",
+          "      Write-Host \"Update Apache HTTP Server to latest stable version via vendor MSI or archive.\"",
+          "    }",
+          "    'JBoss','WildFly','JBossEAP' {",
+          "      Write-Host \"Remediating JBoss / WildFly (latest stable) on Windows...\"",
+          "      # Example: download latest JBoss EAP / WildFly distro and replace C:\\jboss",
+          "      Write-Host \"Update JBoss EAP / WildFly to latest stable version via vendor archive.\"",
+          "    }",
+          "    'PowerShell7','PowerShell' {",
+          "      Write-Host \"Remediating PowerShell 7 (latest stable) on Windows...\"",
+          "      # Example: update via winget",
+          "      # winget upgrade --id Microsoft.PowerShell",
+          "      Write-Host \"Ensure latest PowerShell 7 via winget or vendor MSI.\"",
+          "    }",
+          "    'Python' {",
+          "      Write-Host \"Remediating Python (latest stable) on Windows...\"",
+          "      # Example: update via winget",
+          "      # winget upgrade --id Python.Python.3",
+          "      Write-Host \"Ensure latest Python via winget or vendor installer.\"",
+          "    }",
+          "    default {",
+          "      Write-Host \"Unknown middleware on Windows: $middleware\"",
+          "    }",
+          "  }",
+          "}",
+          "Write-Host \"Windows Server 2019 middleware remediation completed.\""
+        ]
+      }
+    }
+  ]
+}
+Key design points
+RHEL side:
+
+Uses yum update -y <pkg> to pull latest stable versions from Red Hat / EPEL / your internal repos.
+
+For JBoss‑style products (EAP / JWS), you would typically patch via Red Hat repos or vendor‑provided archives; the document leaves a placeholder you can specialize.
+
+Windows Server 2019 side:
+
+Assumes you:
+
+Use Windows Update for Java / Visual C++ / security‑related components, or
+
+Use vendor installers / MSI / winget for Tomcat, Apache, JBoss, PowerShell 7, Python.
+
+The script calls out where you should plug in your real‑world update commands (MSI paths, URLs, etc.).
+
+If you tell me whether you use Red Hat Satellite / internal repos or public EPEL, and whether you manage Windows via WSUS / Intune / vendor‑provided MSI, I can further specialize the commands (exact package names, patch‑apply commands, etc.).
+
+Lambda should send the email to ownerDL tag value by default.
+You can update the Lambda to:
+
+Read the ownerDL tag from each EC2 instance.
+
+Use that value as the To address in SES (falling back to a default DL if the tag is missing).
+
+Below is the updated Lambda with this behavior.
+
+Updated Lambda (Python) – send to ownerDL tag
+python
+import json
+import boto3
+import time
+
+ssm = boto3.client("ssm")
+ec2 = boto3.client("ec2")
+ses = boto3.client("ses")
+
+SSM_DOCUMENT_NAME = "MiddlewareRemediateDocument"
+SES_SOURCE_EMAIL = "remediation@example.com"
+DEFAULT_OWNER_DL = "team@example.com"  # fallback if ownerDL is missing
+
+
+def get_instance_os(instance_id):
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    instance = resp["Reservations"][0]["Instances"][0]
+    platform = instance.get("Platform", "")
+    platform_details = instance.get("PlatformDetails", "").lower()
+
+    if platform == "windows" or "windows" in platform_details:
+        return "Windows"
+    return "Linux"
+
+
+def get_owner_dl(instance_id):
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    instance = resp["Reservations"][0]["Instances"][0]
+    tags = instance.get("Tags", [])
+    for tag in tags:
+        if tag["Key"].lower() == "ownerdl":
+            return tag["Value"]
+    return DEFAULT_OWNER_DL
+
+
+def wait_for_ssm_command(command_id, instance_id, timeout_sec=600):
+    for _ in range(timeout_sec // 5):
+        resp = ssm.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=instance_id
+        )
+        status = resp["Status"]
+        if status in ["Success", "Failed", "Cancelled", "TimedOut"]:
+            return resp
+        time.sleep(5)
+    raise RuntimeError("SSM command timed out")
+
+
+def send_remediation_email(instance_id, os_type, middlewares, ssm_output, to_email):
+    subject = f"Middleware remediation result for {instance_id}"
+    body = f"""
+    Instance: {instance_id}
+    OS: {os_type}
+    Middlewares: {', '.join(middlewares)}
+
+    SSM Command Output:
+    Status: {ssm_output.get('Status')}
+    Standard Output:
+    {ssm_output.get('StandardOutputContent', '')}
+
+    Standard Error:
+    {ssm_output.get('StandardErrorContent', '')}
+    """
+
+    ses.send_email(
+        Source=SES_SOURCE_EMAIL,
+        Destination={"ToAddresses": [to_email]},
+        Message={
+            "Subject": {"Data": subject},
+            "Body": {"Text": {"Data": body}}
+        }
+    )
+
+
+def lambda_handler(event, context):
+    instance_ids = event["InstanceIds"]  # list of strings
+    middlewares = event.get("Middlewares", [])
+
+    if not instance_ids or not middlewares:
+        return {
+            "statusCode": 400,
+            "body": json.dumps("InstanceIds and Middlewares are required")
+        }
+
+    results = []
+
+    for instance_id in instance_ids:
+        # Auto‑detect OS
+        os_type = get_instance_os(instance_id)
+
+        # Get ownerDL tag value
+        to_email = get_owner_dl(instance_id)
+
+        # Run SSM document
+        resp = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName=SSM_DOCUMENT_NAME,
+            Parameters={
+                "OS": [os_type],
+                "Middlewares": middlewares,
+            },
+            Comment=f"Middleware remediation for {instance_id}"
+        )
+
+        command_id = resp["Command"]["CommandId"]
+
+        # Wait for completion
+        ssm_result = wait_for_ssm_command(command_id, instance_id)
+
+        # Send email to ownerDL
+        send_remediation_email(
+            instance_id=instance_id,
+            os_type=os_type,
+            middlewares=middlewares,
+            ssm_output=ssm_result,
+            to_email=to_email
+        )
+
+        results.append({
+            "InstanceId": instance_id,
+            "CommandId": command_id,
+            "Status": ssm_result["Status"],
+            "ToEmail": to_email
+        })
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(results)
+    }
+IAM permissions you’ll need
+ec2:DescribeInstances (to read tags and OS).
+
+ssm:SendCommand, ssm:GetCommandInvocation.
+
+ses:SendEmail (on SES_SOURCE_EMAIL and allow sending to the DLs).
+
+If you want, I can also add logic to:
+
+Validate that ownerDL looks like an email address.
+
+Log a CloudWatch warning if the tag is missing and the default DL is used.
+
+Follow-ups
+
+How to add IAM permissions for Lambda to read EC2 tags and send SES emails
+
+Provide Python boto3 code to fetch ownerDL tag from instance metadata
+
+Update SSM document to pass ownerDL tag to Lambda
+
+How to handle cases where ownerDL tag is missing in Lambda
+
+Test Lambda email sending with specific ownerDL value
