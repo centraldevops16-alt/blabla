@@ -1,0 +1,46 @@
+def get_logs_for_invocation(command_id: str, instance_id: str, log_group: str) -> str:
+    """
+    Fetch stdout from CloudWatch Logs for the SSM command invocation.
+    Assumes log streams named like CommandID/InstanceID/aws/runShellScript/stdout
+    """
+    try:
+        # List log streams matching the pattern
+        response = logs.describe_log_streams(
+            logGroupName=log_group,
+            logStreamNamePrefix=f"{command_id}/{instance_id}/"
+        )
+        streams = [stream['logStreamName'] for stream in response['logStreams'] if '/stdout' in stream['logStreamName']]
+        if not streams:
+            logger.warning(f"No stdout log stream found for {instance_id}")
+            return ''
+        
+        # Select the stdout stream (assume one primary)
+        stdout_stream = next((s for s in streams if 'stdout' in s), streams[0])
+        logger.info(f"Using log stream {stdout_stream} for {instance_id}")
+        
+        # Fetch all log events with proper pagination (startFromHead=True for chronological order)
+        log_events = []
+        kwargs = {
+            'logGroupName': log_group,
+            'logStreamName': stdout_stream,
+            'startFromHead': True,
+            'limit': 10000  # Max per call
+        }
+        while True:
+            resp = logs.get_log_events(**kwargs)
+            if 'events' in resp:
+                log_events.extend(resp['events'])
+            
+            # Check nextForwardToken for forward pagination
+            next_token = resp.get('nextForwardToken')
+            if not next_token or next_token == kwargs.get('nextToken'):
+                break
+            
+            kwargs['nextToken'] = next_token
+        
+        stdout = ''.join(event['message'] for event in log_events if event.get('message'))
+        logger.info(f"Retrieved {len(log_events)} log events ({len(stdout)} chars) from {stdout_stream}")
+        return stdout
+    except Exception as e:
+        logger.error(f"Failed to fetch logs for {instance_id}: {str(e)}")
+        return ''
