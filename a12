@@ -1,0 +1,138 @@
+The regex is working (tested it with your exact output; it finds both PowerShell 7 and Python correctly).
+
+Since ObsoleteCount is still 0, the issue is not the regex; it's likely:
+
+stdout is empty or corrupted when reaching parse_obsolete_lines.
+
+Lambda logging (extra={}) not structured (see below).
+
+Wrong stdout source (perhaps StandardErrorContent instead of StandardOutputContent).
+
+1. Fix: Add debugging to see exactly what stdout contains
+Replace parse_obsolete_lines with this version that logs everything:
+
+python
+def parse_obsolete_lines(stdout: str):
+    logger.info("parse_obsolete_raw_stdout", extra={"StdoutLength": len(stdout), "StdoutPreview": stdout[:500]})
+    
+    if not stdout:
+        logger.warning("parse_obsolete_empty_stdout")
+        return [], {}
+
+    obsolete = []
+    latest_versions = {}
+
+    for i, line in enumerate(stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+
+        logger.debug(f"line_{i}", extra={"RawLine": line})
+
+        if "(obsolete, latest" not in line:
+            continue
+
+        m = re.match(r"^([^:]+):\s*(.*?)\s*\(obsolete,\s*latest\s*(.*?)\)$", line)
+        if m:
+            raw_mw, installed, latest = m.groups()
+            mw = normalize_middleware_name(raw_mw)
+
+            obsolete_line = f"{mw}: {installed} (obsolete, latest {latest})"
+            obsolete.append(obsolete_line)
+            latest_versions[mw] = latest
+
+            logger.info(
+                "obsolete_middleware_found",
+                extra={
+                    "Middleware": mw,
+                    "Installed": installed,
+                    "Latest": latest,
+                    "RawLine": line
+                }
+            )
+        else:
+            logger.warning("obsolete_line_unmatched", extra={"RawLine": line})
+
+    logger.info(
+        "parse_obsolete_complete",
+        extra={
+            "TotalObsolete": len(obsolete),
+            "ObsoleteList": obsolete,
+            "StdoutLines": len(stdout.splitlines())
+        }
+    )
+
+    return obsolete, latest_versions
+2. Fix: CloudWatch logging (extra not showing)
+The extra={} only works if you:
+
+Option A: Enable Lambda Advanced Logging Controls (recommended):
+
+Lambda → Functions → Your function → Configuration → Advanced Logging → Enable “Application logs”.
+
+Enable “Log structure: JSON”.
+
+Option B: Use json.dumps in extra (works without advanced logging):
+
+python
+logger.info("obsolete_middleware_found", 
+    extra={
+        "Middleware": mw,
+        "Installed": installed,
+        "Latest": latest,
+        "RawLine": repr(line)  # repr() for safe logging
+    }
+)
+Option C: Use print for debugging (immediate, no config needed):
+
+python
+print(f"DEBUG: Raw stdout length: {len(stdout)}")
+print(f"DEBUG: stdout preview: {stdout[:200]}...")
+print(f"DEBUG: Found {len(obsolete)} obsolete lines: {obsolete}")
+3. Check: is it StandardOutputContent or StandardErrorContent?
+Your SSM output might be going to stderr. Update the invocation fetch:
+
+python
+try:
+    inv = ssm.get_command_invocation(
+        CommandId=command_id,
+        InstanceId=instance_id
+    )
+    stdout = inv.get("StandardOutputContent", "")
+    stderr = inv.get("StandardErrorContent", "")  # Check stderr too
+    status = inv["Status"]
+    
+    logger.info("ssm_invocation_fetch", extra={
+        "InstanceId": instance_id,
+        "Status": status,
+        "StdoutLength": len(stdout),
+        "StderrLength": len(stderr),
+        "StdoutPreview": stdout[:200],
+        "StderrPreview": stderr[:200]
+    })
+    
+    # Try stdout first, then stderr
+    if stdout:
+        obsolete_list, latest_versions = parse_obsolete_lines(stdout)
+    elif stderr:
+        obsolete_list, latest_versions = parse_obsolete_lines(stderr)
+        logger.warning("using_stderr", extra={"InstanceId": instance_id})
+    else:
+        obsolete_list, latest_versions = [], {}
+        
+except Exception as e:
+    logger.error("ssm_invocation_failed", extra={
+        "InstanceId": instance_id,
+        "Error": str(e)
+    })
+    stdout = ""
+    status = "Failed"
+Run this, check CloudWatch Logs, and you’ll see exactly what’s happening:
+
+Is stdout empty?
+
+Is output in stderr?
+
+Are the obsolete lines there but not matching?
+
+Once we see the logs, we can fix it definitively.
