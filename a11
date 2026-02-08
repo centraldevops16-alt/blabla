@@ -1,0 +1,60 @@
+def parse_obsolete_lines(stdout: str):
+    obsolete = []
+    latest_versions = {}
+
+    if not stdout:
+        logger.debug("parse_obsolete_lines_empty_stdout")
+        return obsolete, latest_versions
+
+    sample_lines = stdout.splitlines()[:50]
+    logger.debug(
+        "parsing_ssm_output",
+        extra={"LineCount": len(sample_lines), "SampleLines": sample_lines}
+    )
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Fast filter: only lines that contain the marker
+        if "(obsolete, latest" not in line:
+            continue
+
+        # Very tolerant regex:
+        # <name>: <anything> (obsolete, latest <anything>)
+        m = re.match(r"^([^:]+):\s*(.*?)\s*\(obsolete,\s*latest\s*(.*?)\)$", line)
+        if not m:
+            # Log the line for debugging if it didn't match
+            logger.debug("obsolete_line_unmatched", extra={"RawLine": line})
+            continue
+
+        raw_mw = m.group(1).strip()
+        installed = m.group(2).strip()
+        latest = m.group(3).strip()
+
+        mw = normalize_middleware_name(raw_mw)
+
+        formatted = f"{mw}: {installed} (obsolete, latest {latest})"
+        obsolete.append(formatted)
+        latest_versions[mw] = latest
+
+        logger.debug(
+            "obsolete_middleware_found",
+            extra={
+                "Middleware": mw,
+                "Installed": installed,
+                "Latest": latest,
+                "RawLine": line
+            }
+        )
+
+    logger.info(
+        "obsolete_middleware_summary",
+        extra={
+            "TotalObsolete": len(obsolete),
+            "ObsoleteList": obsolete
+        }
+    )
+
+    return obsolete, latest_versions
