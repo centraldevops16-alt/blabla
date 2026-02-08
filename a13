@@ -1,0 +1,331 @@
+import json
+import boto3
+import time
+import re
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+ssm = boto3.client('ssm')
+ec2 = boto3.client('ec2')
+sts = boto3.client('sts')
+ses = boto3.client('ses')
+logs = boto3.client('logs')
+
+SSMDOCUMENTNAME = 'CheckMiddlewareVersions'
+SESSOURCEEMAIL = 'remediation@example.com'
+DEFAULTOWNERDL = 'team@example.com'
+MIDDLEWAREDOWNLOADURLS = {
+    'Java': 'https://www.oracle.com/java/technologies/downloads/',
+    'Tomcat': 'https://tomcat.apache.org/download-90.cgi',
+    'Apache': 'https://httpd.apache.org/download.cgi',
+    'JBoss': 'https://www.jboss.org/products/eap/download',
+    'Visual C++': 'https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist',
+    'PowerShell 7': 'https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows',
+    'Python': 'https://www.python.org/downloads/'
+}
+
+def normalize_middleware_name(name: str) -> str:
+    name = str(name).strip()
+    if 'Tomcat' in name:
+        return 'Tomcat'
+    if 'Apache' in name:
+        return 'Apache'
+    if 'JBoss' in name or 'WildFly' in name:
+        return 'JBoss'
+    if 'Visual C++' in name or 'Visual C' in name:
+        return 'Visual C++'
+    if 'PowerShell' in name:
+        return 'PowerShell 7'
+    if 'Python' in name:
+        return 'Python'
+    if 'Java' in name:
+        return 'Java'
+    return name
+
+def get_account_id() -> str:
+    return sts.get_caller_identity()['Account']
+
+def get_instance_name(instance) -> str:
+    tags = instance.get('Tags', [])
+    for tag in tags:
+        if tag['Key'] == 'Name':
+            return tag['Value']
+    return 'no Name tag'
+
+def get_tag_value(instance, key: str) -> str:
+    tags = instance.get('Tags', [])
+    for tag in tags:
+        if tag['Key'] == key:
+            return tag['Value']
+    return 'not set'
+
+def get_owner_dl(instance_id: str) -> str:
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    instance = resp['Reservations'][0]['Instances'][0]
+    tags = instance.get('Tags', [])
+    for tag in tags:
+        if tag['Key'].lower() == 'ownerdl':
+            return tag['Value']
+    return DEFAULTOWNERDL
+
+def get_instance_os(instance) -> str:
+    platform = instance.get('Platform', '').lower()
+    platform_details = instance.get('PlatformDetails', '').lower()
+    if platform == 'windows' or 'windows' in platform_details:
+        return 'Windows'
+    return 'Linux'
+
+def wait_for_ssm_command(command_id: str, instance_ids, timeout_sec: int = 600):
+    """
+    Poll every 10 seconds until each instance has a terminal status (Success, Failed, Cancelled, TimedOut) or timeout is reached.
+    """
+    start_time = time.time()
+    completed = set()
+    failed = set()
+    terminal_states = ['Success', 'Failed', 'Cancelled', 'TimedOut']
+    while time.time() - start_time < timeout_sec and len(completed) < len(instance_ids):
+        resp = ssm.list_command_invocations(
+            CommandId=command_id,
+            Details=False
+        )
+        for inv in resp.get('CommandInvocations', []):
+            iid = inv['InstanceId']
+            status = inv['Status']
+            if status in terminal_states:
+                if iid not in completed:
+                    if status == 'Success':
+                        completed.add(iid)
+                    else:
+                        failed.add(iid)
+        time.sleep(10)
+    return completed, failed
+
+def get_logs_for_invocation(command_id: str, instance_id: str, log_group: str) -> str:
+    """
+    Fetch stdout from CloudWatch Logs for the SSM command invocation.
+    Assumes log streams named like CommandID/InstanceID/aws/runShellScript/stdout
+    """
+    try:
+        # List log streams matching the pattern
+        response = logs.describe_log_streams(
+            logGroupName=log_group,
+            logStreamNamePrefix=f"{command_id}/{instance_id}/"
+        )
+        streams = [stream['logStreamName'] for stream in response['logStreams'] if '/stdout' in stream['logStreamName']]
+        if not streams:
+            logger.warning(f"No stdout log stream found for {instance_id}")
+            return ''
+        # Get the latest stream (most recent)
+        stdout_stream = max(streams, key=lambda s: logs.get_log_events(logGroupName=log_group, logStreamName=s)['events'][-1]['timestamp'] if logs.get_log_events(logGroupName=log_group, logStreamName=s).get('events') else 0)
+        
+        # Get recent log events
+        log_events = []
+        next_token = None
+        while True:
+            resp = logs.get_log_events(
+                logGroupName=log_group,
+                logStreamName=stdout_stream,
+                limit=1000,
+                nextToken=next_token
+            )
+            log_events.extend(resp['events'])
+            next_token = resp.get('nextForwardToken')
+            if not next_token or not resp['events']:
+                break
+        stdout = ''.join(event['message'] for event in log_events)
+        logger.info(f"Retrieved {len(log_events)} log events from {stdout_stream}")
+        return stdout
+    except Exception as e:
+        logger.error(f"Failed to fetch logs for {instance_id}: {str(e)}")
+        return ''
+
+def parse_obsolete_lines(stdout: str):
+    """
+    Parse SSM output and return:
+    - obsolete: list of formatted obsolete lines
+    - latest_versions: dict middleware -> latest version
+    """
+    if not stdout:
+        logger.debug("parse_obsolete_lines: empty stdout")
+        return [], {}
+
+    # Sample first 50 lines for debug
+    sample_lines = stdout.splitlines()[:50]
+    logger.debug(f"Parsing SSM output, LineCount: {len(sample_lines)}, SampleLines: {sample_lines}")
+
+    obsolete = []
+    latest_versions = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'.*obsolete.*latest.*', line)
+        if m:
+            raw_mw = m.group(1).strip()
+            installed = m.group(2).strip()
+            latest = m.group(3).strip()
+            mw = normalize_middleware_name(raw_mw)
+            obsolete_line = f"{mw} {installed} -> obsolete, latest {latest}"
+            obsolete.append(obsolete_line)
+            latest_versions[mw] = latest
+            logger.debug(f"Obsolete middleware found: {mw} {installed} -> {latest}, RawLine: {line}")
+    logger.info(f"Obsolete middleware summary: TotalObsolete: {len(obsolete)}, ObsoleteList: {obsolete}")
+    return obsolete, latest_versions
+
+def send_obsolete_middleware_email(
+    account_id: str,
+    instance_id: str,
+    instance_name: str,
+    region: str,
+    vpc_id: str,
+    private_ip: str,
+    state: str,
+    os_type: str,
+    environment: str,
+    team: str,
+    obsolete_list,
+    latest_versions,
+    to_email: str,
+):
+    if not obsolete_list:
+        logger.info(f"No obsolete middleware for instance {instance_id} {instance_name}")
+        return
+
+    subject = f"Obsolete middleware detected on {instance_name} ({instance_id})"
+    latest_lines = []
+    for mw, latest in latest_versions.items():
+        url = MIDDLEWAREDOWNLOADURLS.get(mw)
+        if url:
+            latest_lines.append(f"{mw}: {latest} ({url})")
+        else:
+            latest_lines.append(f"{mw}: {latest}")
+
+    body = f"""AWS Account ID: {account_id}
+Region: {region}
+Instance ID: {instance_id}
+Instance Name: {instance_name}
+State: {state}
+VPC ID: {vpc_id}
+Private IP: {private_ip}
+OS: {os_type}
+Environment: {environment}
+Team: {team}
+
+The following middleware versions are obsolete and should be updated:
+{chr(10).join(f"- {line}" for line in obsolete_list)}
+
+Latest version available from official sites:
+{chr(10).join(f"- {line}" for line in latest_lines)}
+
+Please plan an update to the latest stable version.""".strip()
+
+    ses.send_email(
+        Source=SESSOURCEEMAIL,
+        Destination={'ToAddresses': [to_email]},
+        Message={
+            'Subject': {'Data': subject},
+            'Body': {'Text': {'Data': body}}
+        }
+    )
+    logger.info(f"Email sent to {to_email} for {instance_id} {instance_name}, ObsoleteCount: {len(obsolete_list)}, ObsoleteList: {obsolete_list}")
+
+def lambda_handler(event, context):
+    account_id = get_account_id()
+    region = context.invoked_function_arn.split(':')[3]
+    logger.info(f"Lambda start: AccountId {account_id}, Region {region}, RequestId {context.aws_request_id}")
+
+    # Discover all running instances
+    instances = []
+    instance_ids = []
+    paginator = ec2.get_paginator('describe_instances')
+    for page in paginator.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
+        for reservation in page['Reservations']:
+            for instance in reservation['Instances']:
+                instances.append(instance)
+                instance_ids.append(instance['InstanceId'])
+    logger.info(f"Instances discovered: InstanceCount {len(instances)}, InstanceIds {instance_ids}")
+
+    if not instance_ids:
+        logger.info("No running instances found")
+        return {'statusCode': 200, 'body': json.dumps({'Summary': 'No running instances found'})}
+
+    # Send SSM command with CloudWatch logging enabled
+    log_group_name = f"aws/ssm/{SSMDOCUMENTNAME}"
+    ssm_resp = ssm.send_command(
+        InstanceIds=instance_ids,
+        DocumentName=SSMDOCUMENTNAME,
+        Parameters={},  # No OS parameter now
+        Comment=f"Check middleware versions on {len(instance_ids)} instances",
+        CloudWatchOutputConfig={
+            'CloudWatchLogGroupName': log_group_name,
+            'CloudWatchOutputEnabled': True
+        }
+    )
+    command_id = ssm_resp['Command']['CommandId']
+    logger.info(f"SSM command sent: CommandId {command_id}, InstanceCount {len(instance_ids)}")
+
+    completed, failed = wait_for_ssm_command(command_id, instance_ids)
+    logger.info(f"SSM command completed: CommandId {command_id}, CompletedCount {len(completed)}, FailedCount {len(failed)}, FailedInstances {list(failed)}")
+
+    total_obsolete_instances = 0
+    results = []
+    for instance in instances:
+        instance_id = instance['InstanceId']
+        instance_name = get_instance_name(instance)
+        vpc_id = instance.get('VpcId', 'unknown')
+        private_ip = instance.get('PrivateIpAddress', 'unknown')
+        state = instance['State']['Name']
+        os_type = get_instance_os(instance)
+        environment = get_tag_value(instance, 'Environment')
+        team = get_tag_value(instance, 'Team')
+        to_email = get_owner_dl(instance_id)
+
+        try:
+            # Instead of get_command_invocation, fetch from CloudWatch Logs
+            stdout = get_logs_for_invocation(command_id, instance_id, log_group_name)
+            status = 'Success' if stdout else 'Failed'
+            obsolete_list, latest_versions = parse_obsolete_lines(stdout)
+            logger.info(f"SSM result per instance: InstanceId {instance_id}, InstanceName {instance_name}, Status {status}, ObsoleteCount {len(obsolete_list)}, LatestVersions {latest_versions}, ObsoleteList {obsolete_list}")
+
+            send_obsolete_middleware_email(
+                account_id=account_id,
+                instance_id=instance_id,
+                instance_name=instance_name,
+                region=region,
+                vpc_id=vpc_id,
+                private_ip=private_ip,
+                state=state,
+                os_type=os_type,
+                environment=environment,
+                team=team,
+                obsolete_list=obsolete_list,
+                latest_versions=latest_versions,
+                to_email=to_email
+            )
+            results.append({
+                'InstanceId': instance_id,
+                'InstanceName': instance_name,
+                'OS': os_type,
+                'CommandId': command_id,
+                'Status': status,
+                'ObsoleteCount': len(obsolete_list),
+                'ToEmail': to_email
+            })
+            if obsolete_list:
+                total_obsolete_instances += 1
+        except Exception as e:
+            logger.error(f"Error processing instance {instance_id}: {str(e)}")
+            results.append({
+                'InstanceId': instance_id,
+                'InstanceName': instance_name,
+                'Status': 'Error',
+                'Error': str(e)
+            })
+
+    logger.info(f"Lambda end: Summary TotalInstances {len(instances)}, CompletedInstances {len(completed)}, FailedInstances {len(failed)}, TotalObsoleteInstances {total_obsolete_instances}, Results [{', '.join([f'InstanceId {r['InstanceId']}, InstanceName {r['InstanceName']}, ObsoleteCount {r.get('ObsoleteCount', 0)}, Status {r.get('Status', 'Unknown')}' for r in results])}]")
+    return {
+        'statusCode': 200,
+        'body': json.dumps(results)
+    }
