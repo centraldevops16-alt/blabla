@@ -1,0 +1,169 @@
+import json
+import boto3
+import logging
+from botocore.exceptions import ClientError, WaiterError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+S3 = boto3.client("s3")
+
+# Rule ID you want to use / look for
+RULE_ID = "KeepOneNoncurrentVersion_IntelligentTiering"
+# How many newer noncurrent versions to keep
+NEWER_NONCURRENT_VERSIONS = 1
+# Optional: days after which noncurrent versions are eligible for deletion
+NONCURRENT_DAYS = 1
+
+
+def rule_matches_target(rule):
+    """Return True if this rule already matches our desired settings."""
+    if rule.get("Status") != "Enabled":
+        return False
+    if rule.get("ID") != RULE_ID:
+        return False
+
+    # Check noncurrent version expiration
+    nve = rule.get("NoncurrentVersionExpiration", {})
+    if nve.get("NewerNoncurrentVersions") != NEWER_NONCURRENT_VERSIONS:
+        return False
+    if nve.get("NoncurrentDays") != NONCURRENT_DAYS:
+        return False
+
+    # If you also want to enforce Intelligent‑Tiering transitions, uncomment:
+    # transitions = rule.get("Transitions", [])
+    # if not any(
+    #     t.get("StorageClass") == "INTELLIGENT_TIERING"
+    #     for t in transitions
+    # ):
+    #     return False
+
+    return True
+
+
+def build_target_rule():
+    """Build the lifecycle rule we want."""
+    return {
+        "ID": RULE_ID,
+        "Status": "Enabled",
+        "Filter": {},  # apply to all objects
+        "NoncurrentVersionExpiration": {
+            "NewerNoncurrentVersions": NEWER_NONCURRENT_VERSIONS,
+            "NoncurrentDays": NONCURRENT_DAYS,
+        },
+        # Optional: transition all versions to Intelligent‑Tiering immediately
+        "Transitions": [
+            {
+                "Days": 0,
+                "StorageClass": "INTELLIGENT_TIERING",
+            }
+        ],
+        "NoncurrentVersionTransitions": [
+            {
+                "NoncurrentDays": 0,
+                "StorageClass": "INTELLIGENT_TIERING",
+            }
+        ],
+    }
+
+
+def lambda_handler(event, context):
+    dry_run = event.get("dry_run", True)  # default to True
+    logger.info(f"Starting with dry_run={dry_run}")
+
+    response = S3.list_buckets()
+    buckets = response["Buckets"]
+
+    # Track results
+    success_count = 0
+    failure_count = 0
+    failures = []
+
+    for bucket in buckets:
+        bucket_name = bucket["Name"]
+        logger.info(f"Processing bucket: {bucket_name}")
+
+        try:
+            lifecycle_resp = S3.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+            rules = lifecycle_resp.get("Rules", [])
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchLifecycleConfiguration":
+                rules = []
+            else:
+                msg = f"Error reading lifecycle for {bucket_name}: {e}"
+                logger.error(msg)
+                failures.append({"bucket": bucket_name, "error": msg})
+                failure_count += 1
+                continue
+        except Exception as e:
+            msg = f"Unexpected error reading lifecycle for {bucket_name}: {e}"
+            logger.error(msg)
+            failures.append({"bucket": bucket_name, "error": msg})
+            failure_count += 1
+            continue
+
+        # Find if any rule already matches our target
+        matching_rule_idx = None
+        for i, rule in enumerate(rules):
+            if rule_matches_target(rule):
+                matching_rule_idx = i
+                break
+
+        if matching_rule_idx is not None:
+            logger.info(f"Bucket {bucket_name}: rule already matches target, skipping.")
+            continue
+
+        # Build the new rule
+        target_rule = build_target_rule()
+
+        if dry_run:
+            logger.info(
+                f"DRY RUN: Would update bucket {bucket_name} with rule: {json.dumps(target_rule)}"
+            )
+            success_count += 1
+            continue
+
+        # Prepare updated rules list
+        new_rules = [r for r in rules if r.get("ID") != RULE_ID]
+        new_rules.append(target_rule)
+
+        # Attempt to update lifecycle
+        try:
+            S3.put_bucket_lifecycle_configuration(
+                Bucket=bucket_name,
+                LifecycleConfiguration={"Rules": new_rules},
+            )
+            logger.info(f"Updated lifecycle for bucket {bucket_name} with rule ID {RULE_ID}")
+            success_count += 1
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            msg = f"Failed to update lifecycle for {bucket_name}: {error_code} - {e}"
+            logger.error(msg)
+            failures.append({"bucket": bucket_name, "error": msg})
+            failure_count += 1
+        except WaiterError as e:
+            msg = f"Waiter error when updating lifecycle for {bucket_name}: {e}"
+            logger.error(msg)
+            failures.append({"bucket": bucket_name, "error": msg})
+            failure_count += 1
+        except Exception as e:
+            msg = f"Unexpected error updating lifecycle for {bucket_name}: {e}"
+            logger.error(msg)
+            failures.append({"bucket": bucket_name, "error": msg})
+            failure_count += 1
+
+    logger.info(
+        f"Processing complete: success={success_count}, failures={failure_count}"
+    )
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(
+            {
+                "message": "Completed processing all buckets",
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "failures": failures,
+            }
+        ),
+    }
