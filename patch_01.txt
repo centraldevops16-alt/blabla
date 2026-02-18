@@ -1,0 +1,1020 @@
+Patch Manager dashboard seems to timeout and kills container when I run the query for 40+ accounts, how can I fix it?
+This happens because your dashboard is doing a lot of work per account/region (multiple SSM and EC2 paginated calls, heavy Pandas + Plotly work) and for 40+ accounts the total runtime and memory spike enough that your ECS container (or whatever host) hits a CPU/memory/time limit and gets killed.
+​
+
+Below is a focused set of changes that reduce per‑run load without changing your UI/UX.
+
+1. Constrain parallelism and batch size
+Right now you use a ThreadPoolExecutor(max_workers=10) and submit one future per (account, region) combination.
+​
+With 40 accounts × N regions, that’s a lot of concurrent SSM/EC2 calls and data structures in memory.
+
+Fix: reduce fan‑out and chunk work.
+
+python
+# In patch dashboard file (grok2.txt logic)
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_WORKERS = 5        # was 10
+MAX_ACCOUNT_BATCH = 10 # process 10 accounts at a time
+
+def fetch_all_data(account_ids, accounts, regions, role):
+    all_inst, all_grp, all_pat, all_err = [], [], [], []
+    total = len(account_ids) * len(regions)
+    done = 0
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    # chunk accounts so you never schedule all 40+ at once
+    for i in range(0, len(account_ids), MAX_ACCOUNT_BATCH):
+        batch_ids = account_ids[i:i + MAX_ACCOUNT_BATCH]
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+            futures = {}
+            for aid in batch_ids:
+                aname = get_account_name_by_id(aid, accounts)
+                for rgn in regions:
+                    f = exe.submit(fetch_account_region_data, aid, aname, rgn, role)
+                    futures[f] = (aname, rgn)
+
+            for f in as_completed(futures):
+                aname, rgn = futures[f]
+                done += 1
+                status.text(f"{aname} / {rgn}: {done}/{total}")
+                progress.progress(done / total)
+
+                try:
+                    i_data, g_data, p_data, e_data = f.result()
+                    all_inst.extend(i_data)
+                    all_grp.extend(g_data)
+                    all_pat.extend(p_data)
+                    all_err.extend(e_data)
+                except Exception as ex:
+                    all_err.append(f"{aname}/{rgn}: {str(ex)[:200]}")
+
+    progress.empty()
+    status.empty()
+    return all_inst, all_grp, all_pat, all_err
+This reduces peak concurrency and memory while still parallelizing.
+​
+
+2. Add hard timeouts per account/region
+A single slow account/region can stall everything. Wrap fetch_account_region_data in a timeout.
+
+python
+import concurrent.futures
+
+PER_CALL_TIMEOUT = 120  # seconds per account+region
+
+# inside fetch_all_data loop above
+for f in as_completed(futures):
+    aname, rgn = futures[f]
+    done += 1
+    status.text(f"{aname} / {rgn}: {done}/{total}")
+    progress.progress(done / total)
+
+    try:
+        i_data, g_data, p_data, e_data = f.result(timeout=PER_CALL_TIMEOUT)
+        all_inst.extend(i_data)
+        all_grp.extend(g_data)
+        all_pat.extend(p_data)
+        all_err.extend(e_data)
+    except concurrent.futures.TimeoutError:
+        all_err.append(f"{aname}/{rgn}: timed out after {PER_CALL_TIMEOUT}s")
+    except Exception as ex:
+        all_err.append(f"{aname}/{rgn}: {str(ex)[:200]}")
+Now a problematic account/region is skipped instead of making the whole dashboard hang and kill the container.
+​
+
+3. Reduce SSM/EC2 work and pagination load
+Within fetch_account_region_data you:
+
+Describe all EC2 instances,
+
+Describe all managed instances,
+
+Paginate describe_instance_patch_states in batches of 50,
+
+Paginate describe_available_patches,
+
+Paginate patch groups and patch group state.
+​
+
+For 40+ accounts, that’s huge. Some easy wins:
+
+Make describe_available_patches optional (behind a checkbox like “Include available patches”). It’s very heavy.
+
+python
+include_patches = st.sidebar.checkbox(
+    "Include Available Patches (slow for many accounts)",
+    value=False,
+    key="include_patches"
+)
+Then in fetch_account_region_data:
+
+python
+def fetch_account_region_data(account_id, account_name, region, role, include_patches=False):
+    ...
+    patches = []
+    ...
+    if include_patches:
+        try:
+            paginator = ssm.get_paginator("describe_available_patches")
+            for page in paginator.paginate():
+                for patch in page.get("Patches", []):
+                    patches.append({...})
+        except Exception as e:
+            errors.append(f"{account_name}/{region} Patches - {str(e)[:50]}")
+    ...
+    return instances, groups, patches, errors
+And pass include_patches into your executor tasks.
+​
+
+Limit “Available Patches” to last N days in collection, not only in filtering.
+Use a cutoff date before appending.
+
+Skip fully empty sections early (if there are no managed instances, don’t call patch states, etc.). You already do this for some paths; extend it consistently.
+​
+
+4. Stream results instead of aggregating everything in memory
+Currently you build all_inst, all_grp, all_pat as huge lists then convert to DataFrames.
+​
+For 40+ accounts this can be large.
+
+Two mitigations:
+
+Drop unnecessary columns early. If you never use some fields from EC2 or SSM, don’t store them.
+
+Use incremental DataFrame building only when needed. For example, only build patdf if user navigates to the “Available Patches” tab.
+
+Example lazy creation:
+
+python
+data = st.session_state.pcdata
+
+# Only build patches DF if tab3 is active
+tab1, tab2, tab3, tab4 = st.tabs(["Compliance Summary", "Instances", "Available Patches", "Missing Patches"])
+
+with tab3:
+    st.subheader("Available Patches Last 60 Days")
+    if data["pat"]:
+        patdf = pd.DataFrame(data["pat"])
+        ...
+    else:
+        st.info("No patch data available.")
+This avoids creating heavy DataFrames for tabs the user never opens.
+​
+
+5. ECS / hosting level tuning
+If you run this on Fargate or ECS:
+
+Increase CPU/memory for the task (e.g., from 0.5 vCPU / 1 GB to 1 vCPU / 2–4 GB) to avoid OOM kills.
+
+Increase container health/idle timeout on the ALB or reverse proxy (if applicable) above your typical fetch time (e.g., 120–180 seconds).
+
+This is complementary to the code-level improvements.
+
+6. If you tell me your environment, I can tune harder
+Useful details to refine the fix:
+
+Are you running on ECS Fargate, EC2, or local/docker?
+
+Typical instance count per account/region?
+
+Are “Available Patches” really needed for every run, or can they be on-demand?
+
+If you paste your current fetch_account_region_data and fetch_all_data blocks (if they changed from grok2.txt), I can give you an exact patched version you can drop in.
+\
+
+
+
+
+
+##########################################################################################################
+
+
+
+"""
+SSM Patch Compliance Dashboard
+- Filter by account and region
+- View patch compliance status across instances
+- Patch compliance summary with aggregated statistics
+- Detailed patch compliance report by instance
+- Patch details with severity breakdown
+- Tabs: Compliance Summary, Instances, Available Patches, Missing Patches
+- Color‑coded compliance status
+- Metrics: Compliant, Non‑Compliant, Unspecified, Unmanaged
+- CSV export per tab
+- Graphs and charts for analysis
+"""
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+import time
+import boto3
+import plotly.graph_objects as go
+import plotly.express as px
+from utils_updated import assume_role, setup_account_filter, get_account_name_by_id
+
+# Page config
+st.set_page_config(
+    page_title="SSM Patch Compliance",
+    page_icon="🛡️",
+    layout="wide",
+)
+
+# Session state init
+if "pcdata" not in st.session_state:
+    st.session_state.pcdata = None
+if "pcrefreshtime" not in st.session_state:
+    st.session_state.pcrefreshtime = None
+if "pcfetchclicked" not in st.session_state:
+    st.session_state.pcfetchclicked = False
+
+st.title("SSM Patch Compliance Dashboard")
+
+# AWS clients
+def get_ssm(account_id, role, region):
+    """Get SSM client for account."""
+    creds = assume_role(account_id, role)
+    if not creds:
+        return None
+    return boto3.client(
+        "ssm",
+        region_name=region,
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+
+def get_ec2(account_id, role, region):
+    """Get EC2 client for account."""
+    creds = assume_role(account_id, role)
+    if not creds:
+        return None
+    return boto3.client(
+        "ec2",
+        region_name=region,
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+
+def get_account_id_by_name(account_name, accounts):
+    """Helper to get account ID by name."""
+    for acc in accounts:
+        if acc.get("Name") == account_name:
+            return acc.get("Id")
+    return None
+
+# DATA COLLECTION
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ fetch_account_region_data: one (account, region)                         │
+# └─────────────────────────────────────────────────────────────────────────┘
+def fetch_account_region_data(account_id, account_name, region, role, include_patches=False):
+    instances = []
+    groups = []
+    patches = []
+    errors = []
+
+    ssm = get_ssm(account_id, role, region)
+    ec2 = get_ec2(account_id, role, region)
+    if not ssm or not ec2:
+        errors.append(f"{account_name}/{region} Auth failed")
+        return instances, groups, patches, errors
+
+    # Get all EC2 instances
+    instance_map = {}
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for res in page.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    iid = inst["InstanceId"]
+                    platform = inst.get("Platform", "linux")  # default to linux if not set
+                    name = next(
+                        (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"),
+                        None,
+                    )
+                    instance_map[iid] = {
+                        "name": name,
+                        "platform": platform,
+                        "state": inst["State"]["Name"],
+                        "launch": inst.get("LaunchTime"),
+                        "managed": False,
+                    }
+    except Exception as e:
+        errors.append(f"{account_name}/{region} EC2 error - {str(e)[:50]}")
+
+    # Get managed instances
+    managed_ids = set()
+    try:
+        paginator = ssm.get_paginator("describe_instance_information")
+        for page in paginator.paginate():
+            for inst in page.get("InstanceInformationList", []):
+                iid = inst["InstanceId"]
+                managed_ids.add(iid)
+                if iid in instance_map:
+                    instance_map[iid]["managed"] = True
+    except Exception as e:
+        errors.append(f"{account_name}/{region} SSM instances - {str(e)[:50]}")
+
+    # Get patch states
+    try:
+        if managed_ids:
+            managed_list = list(managed_ids)
+            batch_size = 50
+            for i in range(0, len(managed_list), batch_size):
+                batch = managed_list[i : i + batch_size]
+                patch_states = ssm.describe_instance_patch_states(InstanceIds=batch)
+                for state in patch_states.get("InstancePatchStates", []):
+                    iid = state["InstanceId"]
+                    if iid not in instance_map:
+                        continue
+                    installed = state.get("InstalledCount", 0)
+                    missing = state.get("MissingCount", 0)
+                    failed = state.get("FailedCount", 0)
+                    unspecified = (
+                        state.get("NotApplicableCount", 0)
+                        + state.get("UnreportedNotApplicableCount", 0)
+                    )
+                    if failed > 0 or missing > 0:
+                        status = "NONCOMPLIANT"
+                    elif unspecified > 0:
+                        status = "UNSPECIFIED"
+                    else:
+                        status = "COMPLIANT"
+                    instances.append(
+                        {
+                            "Account Name": account_name,
+                            "Region": region,
+                            "Instance ID": iid,
+                            "Instance Name": instance_map[iid]["name"],
+                            "Platform": instance_map[iid]["platform"],
+                            "Compliance Status": status,
+                            "Installed Patches": installed,
+                            "Missing Patches": missing,
+                            "Failed Patches": failed,
+                            "Unspecified Patches": unspecified,
+                            "Instance State": instance_map[iid]["state"],
+                            "Launch Time": instance_map[iid]["launch"],
+                            "Managed": True,
+                        }
+                    )
+                    instance_map[iid]["managed"] = True
+    except Exception as e:
+        errors.append(f"{account_name}/{region} Patch states - {str(e)[:50]}")
+
+    # Add unmanaged instances
+    for iid, info in instance_map.items():
+        if not info["managed"]:
+            instances.append(
+                {
+                    "Account Name": account_name,
+                    "Region": region,
+                    "Instance ID": iid,
+                    "Instance Name": info["name"],
+                    "Platform": info["platform"],
+                    "Compliance Status": "UNMANAGED",
+                    "Installed Patches": 0,
+                    "Missing Patches": 0,
+                    "Failed Patches": 0,
+                    "Unspecified Patches": 0,
+                    "Instance State": info["state"],
+                    "Launch Time": info["launch"],
+                    "Managed": False,
+                }
+            )
+
+    # Get patch groups (Compliance Summary)
+    try:
+        paginator = ssm.get_paginator("describe_patch_groups")
+        for page in paginator.paginate():
+            for group in page.get("Mappings", []):
+                group_name = group.get("PatchGroup", "NA")
+                baseline_id = (
+                    group.get("BaselineIdentity", {}).get("BaselineId", "NA")
+                    if group.get("BaselineIdentity")
+                    else "NA"
+                )
+                try:
+                    resp = ssm.describe_patch_group_state(PatchGroup=group_name)
+                    count = resp.get("Instances", 0)
+                    compliant = resp.get("InstancesWithInstalledPatches", 0)
+                    noncompliant = (
+                        resp.get("InstancesWithMissingPatches", 0)
+                        + resp.get("InstancesWithFailedPatches", 0)
+                    )
+                    unspecified = (
+                        resp.get("InstancesWithNotApplicablePatches", 0)
+                        + resp.get("InstancesWithUnreportedNotApplicablePatches", 0)
+                    )
+                    if count > 0 and (compliant > 0 or noncompliant > 0 or unspecified > 0):
+                        groups.append(
+                            {
+                                "Account Name": account_name,
+                                "Region": region,
+                                "Patch Group": group_name,
+                                "Baseline ID": baseline_id,
+                                "Instances Count": count,
+                                "Compliant": compliant,
+                                "Non-Compliant": noncompliant,
+                                "Unspecified": unspecified,
+                            }
+                        )
+                except Exception as e:
+                    errors.append(f"{account_name}/{region} Patch groups - {str(e)[:50]}")
+    except Exception as e:
+        errors.append(f"{account_name}/{region} Patch groups - {str(e)[:50]}")
+
+    # Optionally get available patches
+    if include_patches:
+        try:
+            paginator = ssm.get_paginator("describe_available_patches")
+            for page in paginator.paginate():
+                for patch in page.get("Patches", []):
+                    patches.append(
+                        {
+                            "Account Name": account_name,
+                            "Region": region,
+                            "Patch ID": patch.get("Id", "NA"),
+                            "Title": patch.get("Title", "NA"),
+                            "Classification": patch.get("Classification", "NA"),
+                            "Severity": patch.get("Severity", "NA"),
+                            "Release Date": patch.get("ReleaseDate"),
+                            "Content URL": patch.get("ContentUrl", "NA"),
+                        }
+                    )
+        except Exception as e:
+            errors.append(f"{account_name}/{region} Patches - {str(e)[:50]}")
+
+    return instances, groups, patches, errors
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ fetch_all_data: parallel fetch with batching and timeouts               │
+# └─────────────────────────────────────────────────────────────────────────┘
+MAX_WORKERS = 5          # was 10
+MAX_ACCOUNT_BATCH = 10   # max accounts in flight at once
+PER_CALL_TIMEOUT = 120   # seconds per (account, region)
+
+def fetch_all_data(account_ids, accounts, regions, role, include_patches=False):
+    all_inst, all_grp, all_pat, all_err = [], [], [], []
+    total = len(account_ids) * len(regions)
+    done = 0
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for i in range(0, len(account_ids), MAX_ACCOUNT_BATCH):
+        batch_ids = account_ids[i : i + MAX_ACCOUNT_BATCH]
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+            futures = {}
+            for aid in batch_ids:
+                aname = get_account_name_by_id(aid, accounts)
+                for rgn in regions:
+                    f = exe.submit(
+                        fetch_account_region_data,
+                        aid,
+                        aname,
+                        rgn,
+                        role,
+                        include_patches,
+                    )
+                    futures[f] = (aname, rgn)
+
+            for f in as_completed(futures):
+                aname, rgn = futures[f]
+                done += 1
+                status.text(f"{aname}/{rgn} ({done}/{total})")
+                progress.progress(done / total)
+
+                try:
+                    i_data, g_data, p_data, e_data = f.result(timeout=PER_CALL_TIMEOUT)
+                    all_inst.extend(i_data)
+                    all_grp.extend(g_data)
+                    all_pat.extend(p_data)
+                    all_err.extend(e_data)
+                except TimeoutError:
+                    all_err.append(f"{aname}/{rgn}: timed out after {PER_CALL_TIMEOUT}s")
+                except Exception as ex:
+                    all_err.append(f"{aname}/{rgn}: {str(ex)[:200]}")
+
+    progress.empty()
+    status.empty()
+    return all_inst, all_grp, all_pat, all_err
+
+
+# SIDEBAR CONTROLS
+account_ids, regions = setup_account_filter(page_key="patch")
+
+st.sidebar.markdown("---")
+debug_mode = st.sidebar.checkbox("Show Debug Info", value=False)
+
+# Optional toggle for heavy “Available Patches” collection
+include_patches = st.sidebar.checkbox(
+    "Include Available Patches (slow for many accounts)",
+    value=False,
+    key="include_patches",
+)
+
+if st.sidebar.button(
+    "Fetch Data", type="primary", use_container_width=True, key="patch_fetch"
+):
+    st.session_state.pcfetchclicked = True
+
+# FETCH DATA
+if st.session_state.pcfetchclicked:
+    if not account_ids or not regions:
+        st.error("Please select at least one account and region.")
+        st.session_state.pcfetchclicked = False
+    else:
+        start = time.time()
+        with st.spinner("Scanning patch compliance..."):
+            inst, grp, pat, err = fetch_all_data(
+                account_ids,
+                st.session_state.get("accounts", []),
+                regions,
+                "readonly-role",
+                include_patches,
+            )
+            st.session_state.pcdata = {
+                "inst": inst,
+                "grp": grp,
+                "pat": pat,
+                "err": err,
+            }
+            st.session_state.pcrefreshtime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elapsed = time.time() - start
+            st.success(f"Patch compliance data fetched in {elapsed:.2f}s")
+
+            if err:
+                with st.expander(f"Messages ({len(err)})"):
+                    for e in err:
+                        st.text(e)
+
+        st.session_state.pcfetchclicked = False
+
+# DISPLAY DASHBOARD
+if debug_mode and st.session_state.pcdata and st.session_state.pcdata.get("err"):
+    with st.expander("Debug Info"):
+        for error in st.session_state.pcdata["err"]:
+            st.write(error)
+
+if not st.session_state.pcdata:
+    st.info("Select accounts and regions, then click **Fetch Data** button in sidebar.")
+else:
+    data = st.session_state.pcdata
+    inst_df = pd.DataFrame(data["inst"]) if data["inst"] else pd.DataFrame()
+    grp_df = pd.DataFrame(data["grp"]) if data["grp"] else pd.DataFrame()
+    pat_df = pd.DataFrame(data["pat"]) if data["pat"] else pd.DataFrame()
+
+    # Format dates
+    if not inst_df.empty:
+        inst_df["Launch Time Display"] = inst_df["Launch Time"].apply(
+            lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if isinstance(x, datetime) else "NA"
+        )
+    if not pat_df.empty:
+        pat_df["Release Date Display"] = pat_df["Release Date"].apply(
+            lambda x: x.strftime("%Y-%m-%d") if isinstance(x, datetime) else "NA"
+        )
+
+    # Filter patches to last 60 days (only if we have patches)
+    if not pat_df.empty:
+        sixty_days_ago = datetime.now() - timedelta(days=60)
+        pat_df = pat_df[pat_df["Release Date"] >= sixty_days_ago]
+
+    if inst_df.empty and grp_df.empty and pat_df.empty:
+        st.warning("No patch compliance data found.")
+    else:
+        # Last refresh time
+        if st.session_state.pcrefreshtime:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.caption(f"Last refreshed {st.session_state.pcrefreshtime}")
+            with col2:
+                if st.button("Refresh", type="secondary", use_container_width=True):
+                    start = time.time()
+                    with st.spinner("Refreshing..."):
+                        inst, grp, pat, err = fetch_all_data(
+                            account_ids,
+                            st.session_state.get("accounts", []),
+                            regions,
+                            "readonly-role",
+                            include_patches,
+                        )
+                        st.session_state.pcdata = {
+                            "inst": inst,
+                            "grp": grp,
+                            "pat": pat,
+                            "err": err,
+                        }
+                        st.session_state.pcrefreshtime = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        elapsed = time.time() - start
+                        st.success(f"Refreshed in {elapsed:.2f}s")
+                        if err:
+                            with st.expander(f"Messages ({len(err)})"):
+                                for e in err:
+                                    st.text(e)
+                    st.rerun()
+
+        st.markdown("---")
+
+        # METRICS
+        st.subheader("Summary")
+
+        comp = len(inst_df[inst_df["Compliance Status"] == "COMPLIANT"]) if not inst_df.empty else 0
+        noncomp = len(inst_df[inst_df["Compliance Status"] == "NONCOMPLIANT"]) if not inst_df.empty else 0
+        unsp = len(inst_df[inst_df["Compliance Status"] == "UNSPECIFIED"]) if not inst_df.empty else 0
+        unmg = len(inst_df[inst_df["Compliance Status"] == "UNMANAGED"]) if not inst_df.empty else 0
+        total = len(inst_df)
+        mngd = total - unmg
+        total_missing = int(inst_df["Missing Patches"].sum()) if not inst_df.empty else 0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1:
+            st.metric("Compliant", comp)
+        with m2:
+            st.metric("Non-Compliant", noncomp)
+        with m3:
+            st.metric("Unspecified", unsp)
+        with m4:
+            st.metric("Total Instances", total)
+        with m5:
+            if total > 0:
+                pct = comp / total * 100
+                st.metric("Compliance %", f"{pct:.1f}")
+            else:
+                st.metric("Compliance %", "0.0")
+
+        st.markdown("---")
+
+        # FILTERS
+        st.subheader("Filters")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            acc_opts = sorted(inst_df["Account Name"].unique()) if not inst_df.empty else []
+            acc_sel = st.multiselect(
+                "Account",
+                options=acc_opts,
+                default=acc_opts,
+                key="patch_account",
+            )
+        with f2:
+            rgn_opts = sorted(inst_df["Region"].unique()) if not inst_df.empty else []
+            rgn_sel = st.multiselect(
+                "Region",
+                options=rgn_opts,
+                default=rgn_opts,
+                key="patch_region",
+            )
+        with f3:
+            sts_opts = sorted(inst_df["Compliance Status"].unique()) if not inst_df.empty else []
+            sts_sel = st.multiselect(
+                "Compliance Status",
+                options=sts_opts,
+                default=sts_opts,
+                key="patch_status",
+            )
+
+        filtered_inst = (
+            inst_df[
+                inst_df["Account Name"].isin(acc_sel)
+                & inst_df["Region"].isin(rgn_sel)
+                & inst_df["Compliance Status"].isin(sts_sel)
+            ]
+            if not inst_df.empty
+            else pd.DataFrame()
+        )
+        filtered_pat = (
+            pat_df[
+                pat_df["Account Name"].isin(acc_sel)
+                & pat_df["Region"].isin(rgn_sel)
+            ]
+            if not pat_df.empty
+            else pd.DataFrame()
+        )
+
+        st.markdown("---")
+
+        # CHARTS
+        st.subheader("Overview")
+        c1, c2, c3 = st.columns(3)
+
+        # Managed vs Unmanaged
+        with c1:
+            mngd_val = mngd
+            unmg_val = unmg
+            mng_data = [mngd_val, unmg_val]
+            mng_labs = ["Managed by SSM", "Unmanaged"]
+            mng_cols = ["#28a745", "#dc3545"]
+            fig = go.Figure(
+                data=go.Pie(
+                    labels=mng_labs,
+                    values=mng_data,
+                    marker=dict(colors=mng_cols),
+                    hole=0.3,
+                )
+            )
+            fig.update_layout(
+                title_text="Instance Management Status",
+                height=400,
+                showlegend=True,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Compliance
+        with c2:
+            comp_data = [comp, noncomp, unsp, unmg]
+            comp_labs = ["Compliant", "Non-Compliant", "Unspecified", "Unmanaged"]
+            comp_cols = ["#28a745", "#dc3545", "#ffc107", "#6c757d"]
+            # Only show non‑zero slices
+            comp_data_flt = [v for v in comp_data if v > 0]
+            comp_labs_flt = [l for v, l in zip(comp_data, comp_labs) if v > 0]
+            comp_cols_flt = [c for v, c in zip(comp_data, comp_cols) if v > 0]
+            fig = go.Figure(
+                data=go.Pie(
+                    labels=comp_labs_flt,
+                    values=comp_data_flt,
+                    marker=dict(colors=comp_cols_flt),
+                    hole=0.3,
+                )
+            )
+            fig.update_layout(
+                title_text="Compliance Summary",
+                height=400,
+                showlegend=True,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Non‑compliance reasons
+        with c3:
+            if not filtered_inst.empty:
+                miss_cnt = len(filtered_inst[filtered_inst["Missing Patches"] > 0])
+                fail_cnt = len(filtered_inst[filtered_inst["Failed Patches"] > 0])
+                if miss_cnt > 0 or fail_cnt > 0:
+                    nc_data = []
+                    nc_labs = []
+                    nc_cols = []
+                    if miss_cnt > 0:
+                        nc_data.append(miss_cnt)
+                        nc_labs.append("Missing Patches")
+                        nc_cols.append("#fd7e14")
+                    if fail_cnt > 0:
+                        nc_data.append(fail_cnt)
+                        nc_labs.append("Failed Patches")
+                        nc_cols.append("#dc3545")
+                    fig = go.Figure(
+                        data=go.Pie(
+                            labels=nc_labs,
+                            values=nc_data,
+                            marker=dict(colors=nc_cols),
+                            hole=0.3,
+                        )
+                    )
+                    fig.update_layout(
+                        title_text="Non-Compliance Reasons",
+                        height=400,
+                        showlegend=True,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No non‑compliance data")
+            else:
+                st.info("No data to display")
+
+        st.markdown("---")
+
+        # Additional charts
+        if not filtered_inst.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                acc_counts = filtered_inst["Account Name"].value_counts()
+                fig = go.Figure(
+                    data=go.Bar(
+                        x=acc_counts.index,
+                        y=acc_counts.values,
+                        marker_color="#ff7f0e",
+                    )
+                )
+                fig.update_layout(
+                    title_text="Instances by Account",
+                    xaxis_title="Account",
+                    yaxis_title="Count",
+                    height=400,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with c2:
+                plt_counts = filtered_inst["Platform"].value_counts()
+                fig = go.Figure(
+                    data=go.Bar(
+                        x=plt_counts.index,
+                        y=plt_counts.values,
+                        marker_color="#1f77b4",
+                    )
+                )
+                fig.update_layout(
+                    title_text="Instances by Platform",
+                    xaxis_title="Platform",
+                    yaxis_title="Count",
+                    height=400,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+
+        # TABS
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["Compliance Summary", "Instances", "Available Patches", "Missing Patches"]
+        )
+
+        with tab1:
+            st.subheader("Patch Compliance Summary by Patch Group")
+            if not grp_df.empty:
+                grp_df = grp_df.dropna(how="all")  # Remove any fully empty rows
+                display_cols = [
+                    "Patch Group",
+                    "Baseline ID",
+                    "Instances Count",
+                    "Compliant",
+                    "Non-Compliant",
+                    "Unspecified",
+                    "Account Name",
+                    "Region",
+                ]
+                display_df = grp_df[display_cols].reset_index(drop=True)
+                st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
+                csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="Download Compliance Summary CSV",
+                    data=csv,
+                    file_name=f"compliance_summary_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("No compliance summary data available.")
+
+        with tab2:
+            st.subheader("Instance Patch Compliance Report")
+            if not filtered_inst.empty:
+                filtered_inst = filtered_inst.dropna(how="all")
+                display_cols = [
+                    "Instance ID",
+                    "Instance Name",
+                    "Platform",
+                    "Compliance Status",
+                    "Managed",
+                    "Installed Patches",
+                    "Missing Patches",
+                    "Failed Patches",
+                    "Unspecified Patches",
+                    "Instance State",
+                    "Launch Time Display",
+                    "Account Name",
+                    "Region",
+                ]
+                display_df = (
+                    filtered_inst[display_cols]
+                    .sort_values("Compliance Status")
+                    .reset_index(drop=True)
+                )
+
+                def highlight_compliance(row):
+                    status = row["Compliance Status"]
+                    if status == "NONCOMPLIANT":
+                        return ["background-color: #f8d7da"] * len(row)
+                    elif status == "UNSPECIFIED":
+                        return ["background-color: #fff3cd"] * len(row)
+                    elif status == "UNMANAGED":
+                        return ["background-color: #e2e3e5"] * len(row)
+                    else:
+                        return ["background-color: #d4edda"] * len(row)
+
+                st.dataframe(
+                    display_df.style.apply(highlight_compliance, axis=1),
+                    use_container_width=True,
+                    height=500,
+                    hide_index=True,
+                )
+                csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="Download Instances CSV",
+                    data=csv,
+                    file_name=f"patch_instances_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("No instance data available.")
+
+        with tab3:
+            st.subheader("Available Patches (Last 60 Days)")
+            if not filtered_pat.empty:
+                filtered_pat = filtered_pat.dropna(how="all")
+                unique_patches = filtered_pat.drop_duplicates(subset=["Patch ID"]).copy()
+                display_cols = [
+                    "Patch ID",
+                    "Title",
+                    "Classification",
+                    "Severity",
+                    "Release Date Display",
+                    "Content URL",
+                ]
+                display_df = (
+                    unique_patches[display_cols]
+                    .sort_values("Severity", ascending=False)
+                    .reset_index(drop=True)
+                )
+
+                def highlight_severity(row):
+                    severity = row["Severity"]
+                    if severity == "Critical":
+                        return ["background-color: #dc3545"] * len(row)
+                    elif severity == "High":
+                        return ["background-color: #fd7e14"] * len(row)
+                    elif severity == "Medium":
+                        return ["background-color: #ffc107"] * len(row)
+                    else:
+                        return ["background-color: #d4edda"] * len(row)
+
+                st.dataframe(
+                    display_df.style.apply(highlight_severity, axis=1),
+                    use_container_width=True,
+                    height=500,
+                    hide_index=True,
+                )
+                csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="Download Patches CSV",
+                    data=csv,
+                    file_name=f"available_patches_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("No patch data available.")
+
+        with tab4:
+            st.subheader("Missing Patches per Instance")
+            if not filtered_inst.empty:
+                selected_instance = st.selectbox(
+                    "Select Instance",
+                    options=filtered_inst["Instance ID"].unique(),
+                )
+                row = filtered_inst[
+                    filtered_inst["Instance ID"] == selected_instance
+                ].iloc[0]
+                account_name = row["Account Name"]
+                region = row["Region"]
+                ssm = get_ssm(
+                    get_account_id_by_name(account_name, st.session_state.get("accounts", [])),
+                    "readonly-role",
+                    region,
+                )
+                if ssm:
+                    try:
+                        missing_patches = []
+                        paginator = ssm.get_paginator("describe_instance_patches")
+                        for page in paginator.paginate(
+                            InstanceId=selected_instance,
+                            Filters=[{"Key": "State", "Values": ["Missing"]}],
+                        ):
+                            for patch in page.get("Patches", []):
+                                missing_patches.append(
+                                    {
+                                        "Patch ID": patch.get("KBId", patch.get("Id", "NA")),
+                                        "Title": patch.get("Title", "NA"),
+                                        "Classification": patch.get("Classification", "NA"),
+                                        "Severity": patch.get("Severity", "NA"),
+                                        "Release Date": (
+                                            patch.get("ReleaseDate").strftime("%Y-%m-%d")
+                                            if patch.get("ReleaseDate")
+                                            else "NA"
+                                        ),
+                                    }
+                                )
+                        if missing_patches:
+                            missing_df = pd.DataFrame(missing_patches)
+                            st.dataframe(missing_df, use_container_width=True)
+                            csv = missing_df.to_csv(index=False)
+                            st.download_button(
+                                label="Download Missing Patches CSV",
+                                data=csv,
+                                file_name=f"missing_patches_{selected_instance}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv",
+                                mime="text/csv",
+                            )
+                        else:
+                            st.info("No missing patches for this instance.")
+                    except Exception as e:
+                        st.error(f"Error fetching missing patches: {str(e)}")
+                else:
+                    st.error("Failed to get SSM client for this account/region.")
+            else:
+                st.info("No instances available.")
