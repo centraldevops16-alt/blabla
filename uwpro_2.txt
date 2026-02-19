@@ -1,0 +1,450 @@
+schemaVersion: '0.3'
+description: >
+  Upgrades an existing Windows Tomcat instance by downloading a Tomcat package
+  from JFrog, backing up the current installation, deploying the new version,
+  preserving configuration/webapps, updating registry metadata, validating
+  service startup, logging file changes, and cleaning up temporary artifacts.
+  Supports a dry-run mode that logs intended actions without making changes.
+
+parameters:
+  jfrogTomcatUrl:
+    type: String
+    description: JFrog URL to download the Tomcat zip
+  instanceId:
+    type: String
+    description: Target Windows EC2 instance ID
+  rootDir:
+    type: String
+    description: Root folder where Tomcat is installed (e.g. C:\Tomcat)
+  username:
+    type: String
+    description: JFrog username
+  password:
+    type: String
+    description: JFrog password
+    noEcho: true
+  version:
+    type: String
+    description: Tomcat version string to store in registry (e.g. 10.1.20)
+  DirectoryName:
+    type: String
+    description: Tomcat directory name under root (e.g. tomcat10-PF-DEV)
+  ServiceName:
+    type: String
+    description: Windows service name for Tomcat
+  component:
+    type: String
+    description: Logical component name used in paths
+  deployenv:
+    type: String
+    description: Deploy environment tag (e.g. DEV/QA/PRD)
+  dryRun:
+    type: String
+    allowedValues:
+      - true
+      - false
+    default: false
+    description: >
+      When true, do not perform any changes; only log actions that would be executed.
+
+mainSteps:
+  - name: UpgradeTomcat
+    action: aws:runCommand
+    description: Upgrade Tomcat on the target instance
+    isEnd: true
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - "{{ instanceId }}"
+      Parameters:
+        commands:
+          - |
+            param(
+              [string]$jfrogTomcatUrl    = "{{ jfrogTomcatUrl }}",
+              [string]$username          = "{{ username }}",
+              [string]$password          = "{{ password }}",
+              [string]$rootDir           = "{{ rootDir }}",
+              [string]$directoryName     = "{{ DirectoryName }}",
+              [string]$serviceName       = "{{ ServiceName }}",
+              [string]$component         = "{{ component }}",
+              [string]$deployEnv         = "{{ deployenv }}",
+              [string]$version           = "{{ version }}",
+              [string]$dryRunParam       = "{{ dryRun }}"
+            )
+
+            #------------------ Helper & mode flags ------------------#
+            $ErrorActionPreference = 'Stop'
+
+            $IsDryRun = $false
+            if ($dryRunParam.ToLower() -eq 'true') {
+              $IsDryRun = $true
+            }
+
+            function Write-Info {
+              param([string]$Message)
+              if ($IsDryRun) {
+                Write-Host "[DRY-RUN] $Message"
+              } else {
+                Write-Host "[INFO]    $Message"
+              }
+            }
+
+            function Write-Warn {
+              param([string]$Message)
+              Write-Warning "[WARN]    $Message"
+            }
+
+            function Write-Err {
+              param([string]$Message)
+              Write-Error "[ERROR]   $Message"
+            }
+
+            function Log-Error {
+              param(
+                [string]$Message,
+                [string]$ErrorLogPath
+              )
+              Write-Err $Message
+              if (-not $IsDryRun) {
+                try {
+                  Add-Content -Path $ErrorLogPath -Value ("{0} - {1}" -f (Get-Date), $Message) -ErrorAction SilentlyContinue
+                } catch { }
+              }
+              throw $Message
+            }
+
+            function Wait-ForTomcat {
+              param(
+                [string]$LogFile,
+                [string]$Message,
+                [int]$TimeoutSeconds = 480,
+                [int]$DelaySeconds   = 5
+              )
+
+              if ($IsDryRun) {
+                Write-Info "Would wait for Tomcat log '$LogFile' to contain message '$Message' (timeout=${TimeoutSeconds}s, delay=${DelaySeconds}s)."
+                return $true
+              }
+
+              $elapsed = 0
+              Write-Info "Waiting for Tomcat to start (timeout = $TimeoutSeconds s)..."
+              while ($elapsed -lt $TimeoutSeconds) {
+                try {
+                  if (Test-Path -Path $LogFile) {
+                    $content = Get-Content -Path $LogFile -Tail 50 -ErrorAction Stop
+                    if ($content | Select-String -Pattern $Message -Quiet) {
+                      Write-Info "Tomcat is up and running; startup message found in log."
+                      return $true
+                    }
+                  } else {
+                    Write-Warn "Tomcat log file not yet present at '$LogFile'."
+                  }
+                } catch {
+                  Write-Warn "Error reading Tomcat log file: $($_.Exception.Message)"
+                }
+                Start-Sleep -Seconds $DelaySeconds
+                $elapsed += $DelaySeconds
+              }
+              return $false
+            }
+
+            if ($IsDryRun) {
+              Write-Host "=========== DRY RUN MODE ENABLED ==========="
+              Write-Host "No changes will be made; logging intended actions only."
+            } else {
+              Write-Host "=========== LIVE RUN (dryRun=false) =========="
+            }
+
+            #------------------ Variable setup ------------------#
+            $tomcatDir     = Join-Path -Path $rootDir -ChildPath $directoryName
+            $backupDir     = Join-Path -Path $rootDir -ChildPath ("Backup_{0}" -f $component)
+            $tempDir       = Join-Path -Path $rootDir -ChildPath "JfrogPackage\TomcatUpgrade"
+            $logDir        = Join-Path -Path $rootDir -ChildPath ("logs_{0}" -f $component)
+
+            $logDate       = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+            $logFilePath   = Join-Path -Path $logDir -ChildPath ("catalina_{0}.log" -f $logDate)
+            $logBeforePath = Join-Path -Path $logDir -ChildPath ("Files_beforeBuild_{0}.log" -f $logDate)
+            $logAfterPath  = Join-Path -Path $logDir -ChildPath ("Files_afterBuild_{0}.log" -f $logDate)
+            $diffPath      = Join-Path -Path $logDir -ChildPath ("modifiedFiles_{0}.log" -f $logDate)
+            $errorLogPath  = Join-Path -Path $tempDir -ChildPath "error.log"
+
+            $tomcatZipPath = Join-Path -Path $tempDir -ChildPath "apache_tomcat.zip"
+
+            Write-Info "Tomcat directory     : $tomcatDir"
+            Write-Info "Backup directory     : $backupDir"
+            Write-Info "Temp upgrade dir     : $tempDir"
+            Write-Info "Log directory        : $logDir"
+            Write-Info "Service name         : $serviceName"
+            Write-Info "Deploy environment   : $deployEnv"
+            Write-Info "Target Tomcat version: $version"
+
+            #------------------ Create directories ------------------#
+            try {
+              foreach ($d in @($backupDir, $tempDir, $logDir)) {
+                if (-not (Test-Path -Path $d)) {
+                  Write-Info "Would create directory '$d'."
+                  if (-not $IsDryRun) {
+                    New-Item -Path $d -ItemType Directory -Force | Out-Null
+                  }
+                } else {
+                  Write-Info "Directory '$d' already exists."
+                }
+              }
+            } catch {
+              Log-Error -Message ("Error creating directories: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Download Tomcat from JFrog ------------------#
+            try {
+              Write-Info "Would download new Tomcat package from JFrog to '$tomcatZipPath'."
+              if (-not $IsDryRun) {
+                $secPass = ConvertTo-SecureString -String $password -AsPlainText -Force
+                $cred    = New-Object System.Management.Automation.PSCredential ($username, $secPass)
+
+                Invoke-WebRequest -Uri $jfrogTomcatUrl `
+                                  -Credential $cred `
+                                  -OutFile $tomcatZipPath `
+                                  -UseBasicParsing `
+                                  -TimeoutSec 600
+                Write-Info "Download completed."
+              }
+            } catch {
+              Log-Error -Message ("Error downloading Tomcat package: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Stop Tomcat service ------------------#
+            try {
+              Write-Info "Would check and stop Tomcat service '$serviceName' if running."
+              if (-not $IsDryRun) {
+                $svc = Get-Service -Name $serviceName -ErrorAction Stop
+                Write-Info ("Current service status: {0}" -f $svc.Status)
+
+                if ($svc.Status -ne 'Stopped') {
+                  Write-Info "Stopping Tomcat service..."
+                  Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                  $svc = Get-Service -Name $serviceName -ErrorAction Stop
+                  Write-Info ("Service status after stop: {0}" -f $svc.Status)
+                } else {
+                  Write-Info "Service already stopped."
+                }
+              }
+            } catch {
+              Log-Error -Message ("Error stopping Tomcat service '{0}': {1}" -f $serviceName, $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Backup current Tomcat ------------------#
+            try {
+              if (-not (Test-Path -Path $tomcatDir)) {
+                Log-Error -Message ("Tomcat directory '{0}' does not exist; aborting." -f $tomcatDir) -ErrorLogPath $errorLogPath
+              }
+
+              $timestamp   = Get-Date -Format 'yyyyMMddHHmmss'
+              $backupFile  = Join-Path -Path $backupDir -ChildPath ("TomcatBackup_{0}.zip" -f $timestamp)
+              Write-Info "Would backup current Tomcat directory to '$backupFile'."
+              if (-not $IsDryRun) {
+                Compress-Archive -Path (Join-Path $tomcatDir '*') `
+                                 -DestinationPath $backupFile `
+                                 -CompressionLevel Fastest `
+                                 -Force
+                Write-Info "Backup completed."
+              }
+            } catch {
+              Log-Error -Message ("Error backing up Tomcat installation: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Extract new Tomcat ------------------#
+            $newTomcatRoot = $null
+            $newTomcatDir  = $null
+            try {
+              Write-Info "Would extract downloaded Tomcat package under '$tempDir'."
+              if (-not $IsDryRun) {
+                Expand-Archive -Path $tomcatZipPath -DestinationPath $tempDir -Force
+                $newTomcatRoot = Get-ChildItem -Path $tempDir -Directory | Where-Object { $_.Name -ne 'logs' } | Select-Object -First 1
+                if (-not $newTomcatRoot) {
+                  Log-Error -Message "Unable to determine extracted Tomcat directory under '$tempDir'." -ErrorLogPath $errorLogPath
+                }
+                $newTomcatDir = $newTomcatRoot.FullName
+                Write-Info "New Tomcat extracted at '$newTomcatDir'."
+              } else {
+                $newTomcatDir = Join-Path -Path $tempDir -ChildPath "<extracted-tomcat-dir>"
+              }
+            } catch {
+              Log-Error -Message ("Error extracting new Tomcat archive: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Capture 'before' file inventory ------------------#
+            try {
+              Write-Info "Would capture file inventory BEFORE upgrade to '$logBeforePath'."
+              if (-not $IsDryRun) {
+                Get-ChildItem -Path $tomcatDir -Recurse -File |
+                  Select-Object FullName, LastWriteTime |
+                  ForEach-Object {
+                    "{0} - Last Modified: {1:o}" -f $_.FullName, $_.LastWriteTime
+                  } | Out-File -FilePath $logBeforePath -Encoding UTF8
+              }
+            } catch {
+              Log-Error -Message ("Error capturing 'before' file inventory: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Copy config & webapps to new Tomcat ------------------#
+            try {
+              Write-Info "Would copy configuration and webapps from '$tomcatDir' to new Tomcat directory '$newTomcatDir'."
+              if (-not $IsDryRun) {
+                $oldConf  = Join-Path -Path $tomcatDir     -ChildPath 'conf'
+                $oldBin   = Join-Path -Path $tomcatDir     -ChildPath 'bin'
+                $oldApps  = Join-Path -Path $tomcatDir     -ChildPath 'webapps'
+                $newConf  = Join-Path -Path $newTomcatDir  -ChildPath 'conf'
+                $newBin   = Join-Path -Path $newTomcatDir  -ChildPath 'bin'
+                $newApps  = Join-Path -Path $newTomcatDir  -ChildPath 'webapps'
+
+                if (Test-Path $oldConf) {
+                  Copy-Item -Path (Join-Path $oldConf '*') -Destination $newConf -Recurse -Force
+                }
+
+                if (Test-Path $oldApps) {
+                  Copy-Item -Path (Join-Path $oldApps '*') -Destination $newApps -Recurse -Force
+                }
+
+                if (Test-Path $oldBin) {
+                  Copy-Item -Path (Join-Path $oldBin '*') -Destination $newBin -Recurse -Force
+                }
+
+                Write-Info "Configuration and webapps copy completed."
+              }
+            } catch {
+              Log-Error -Message ("Error copying configuration/webapps: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Replace old Tomcat with new ------------------#
+            try {
+              Write-Info "Would replace existing Tomcat directory '$tomcatDir' with new Tomcat directory '$newTomcatDir'."
+              if (-not $IsDryRun) {
+                if (Test-Path -Path $tomcatDir) {
+                  Remove-Item -Path $tomcatDir -Recurse -Force -ErrorAction Stop
+                }
+                Move-Item -Path $newTomcatDir -Destination $tomcatDir -Force
+                Write-Info "Tomcat replacement completed. New Tomcat located at '$tomcatDir'."
+              }
+            } catch {
+              Log-Error -Message ("Error replacing Tomcat installation: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Update Tomcat registry info ------------------#
+            try {
+              $tomcatDirectoryParts = $directoryName.Split('\', 2)
+              $regServiceName = if ($tomcatDirectoryParts.Count -gt 1) { $tomcatDirectoryParts[1] } else { $directoryName }
+
+              $regBase   = "HKLM:\SOFTWARE\Apache Software Foundation\Tomcat\10.1"
+              $regPath   = Join-Path -Path $regBase -ChildPath $regServiceName
+
+              Write-Info "Would update registry at '$regPath' with Version='$version' and InstallPath='$tomcatDir'."
+              if (-not $IsDryRun) {
+                if (-not (Test-Path -Path $regPath)) {
+                  Write-Warn "Registry path '$regPath' not found; creating it."
+                  New-Item -Path $regPath -Force | Out-Null
+                }
+
+                Set-ItemProperty -Path $regPath -Name 'Version'     -Value $version -Force
+                Set-ItemProperty -Path $regPath -Name 'InstallPath' -Value $tomcatDir -Force
+              }
+            } catch {
+              Log-Error -Message ("Error updating Tomcat registry entries: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Start Tomcat service ------------------#
+            try {
+              Write-Info "Would start Tomcat service '$serviceName' and verify status."
+              if (-not $IsDryRun) {
+                Start-Service -Name $serviceName -ErrorAction Stop
+                $svc = Get-Service -Name $serviceName -ErrorAction Stop
+                Write-Info ("Service status after start: {0}" -f $svc.Status)
+              }
+            } catch {
+              Log-Error -Message ("Error starting Tomcat service '{0}': {1}" -f $serviceName, $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Wait for Tomcat to be up ------------------#
+            $startupMessage = 'Server startup in'
+            if (-not (Wait-ForTomcat -LogFile $logFilePath -Message $startupMessage -TimeoutSeconds 480 -DelaySeconds 5)) {
+              Log-Error -Message "Tomcat did not become ready within the timeout period." -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Capture 'after' file inventory ------------------#
+            $filesBefore = @()
+            $filesAfter  = @()
+            try {
+              Write-Info "Would capture file inventory AFTER upgrade to '$logAfterPath' and compute diff to '$diffPath'."
+              if (-not $IsDryRun) {
+                Get-ChildItem -Path $tomcatDir -Recurse -File |
+                  Select-Object FullName, LastWriteTime |
+                  ForEach-Object {
+                    "{0} - Last Modified: {1:o}" -f $_.FullName, $_.LastWriteTime
+                  } | Out-File -FilePath $logAfterPath -Encoding UTF8
+
+                $filesBefore = Get-Content -Path $logBeforePath | ForEach-Object {
+                  $parts = $_ -split ' - Last Modified: '
+                  [PSCustomObject]@{
+                    FileName     = $parts[0]
+                    LastModified = [datetime]$parts[1]
+                  }
+                }
+
+                $filesAfter = Get-Content -Path $logAfterPath | ForEach-Object {
+                  $parts = $_ -split ' - Last Modified: '
+                  [PSCustomObject]@{
+                    FileName     = $parts[0]
+                    LastModified = [datetime]$parts[1]
+                  }
+                }
+
+                Write-Info "Comparing BEFORE and AFTER file inventories..."
+                $differences = @()
+
+                foreach ($fileAfter in $filesAfter) {
+                  $match = $filesBefore | Where-Object { $_.FileName -eq $fileAfter.FileName } | Select-Object -First 1
+                  if ($null -ne $match) {
+                    if ($match.LastModified -ne $fileAfter.LastModified) {
+                      $differences += [PSCustomObject]@{
+                        FileName            = $fileAfter.FileName
+                        LastModifiedBefore  = $match.LastModified
+                        LastModifiedAfter   = $fileAfter.LastModified
+                      }
+                    }
+                  } else {
+                    $differences += [PSCustomObject]@{
+                      FileName            = $fileAfter.FileName
+                      LastModifiedBefore  = 'N/A'
+                      LastModifiedAfter   = $fileAfter.LastModified
+                    }
+                  }
+                }
+
+                $differences | ForEach-Object {
+                  "{0} - Before: {1} - After: {2}" -f $_.FileName, $_.LastModifiedBefore, $_.LastModifiedAfter
+                } | Out-File -FilePath $diffPath -Encoding UTF8
+
+                Write-Info ("Total files BEFORE: {0}" -f $filesBefore.Count)
+                Write-Info ("Total files AFTER : {0}" -f $filesAfter.Count)
+                Write-Info ("Total modified/new files: {0}" -f $differences.Count)
+              }
+            } catch {
+              Log-Error -Message ("Error capturing/comparing file inventories: {0}" -f $_.Exception.Message) -ErrorLogPath $errorLogPath
+            }
+
+            #------------------ Cleanup temporary content ------------------#
+            try {
+              Write-Info "Would clean up temporary upgrade content under '$tempDir'."
+              if (-not $IsDryRun) {
+                if (Test-Path -Path $tempDir) {
+                  Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+              }
+            } catch {
+              Write-Warn ("Error during cleanup of temp directory '{0}': {1}" -f $tempDir, $_.Exception.Message)
+            }
+
+            if ($IsDryRun) {
+              Write-Host "=========== DRY RUN COMPLETED (no changes made) ==========="
+            } else {
+              Write-Host "=========== TOMCAT UPGRADE COMPLETED SUCCESSFULLY ========="
+            }
