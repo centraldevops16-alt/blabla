@@ -1,0 +1,78 @@
+Most likely the upgrade ran, but the registry key we update does not match the one your service actually uses, so you still see the old version.
+
+1. Where the document writes the version
+In the current script we do:
+
+powershell
+$regBase = "HKLM:\SOFTWARE\Apache Software Foundation\Tomcat\10.1"
+$regPath = Join-Path -Path $regBase -ChildPath $regServiceName
+Set-ItemProperty -Path $regPath -Name 'Version' -Value $version
+Set-ItemProperty -Path $regPath -Name 'InstallPath' -Value $tomcatDir
+This assumes that for your service there is a key like:
+
+HKLM\SOFTWARE\Apache Software Foundation\Tomcat\10.1\<regServiceName>
+
+with Version and InstallPath values.
+
+2. Why this may not match your setup
+On real installs you typically see:
+
+HKLM\SOFTWARE\Apache Software Foundation\Tomcat\10.1\Tomcat10 or Tomcat10-PF-DEV_node1 (or under WOW6432Node for 32‑bit).
+
+Issues that would leave the version “old”:
+
+The actual key is under
+HKLM\SOFTWARE\WOW6432Node\Apache Software Foundation\Tomcat\10.1\..., but we only write to the non‑WOW6432Node path.
+
+The leaf key name is not what we derive in $regServiceName; with ServiceName = Tomcat10-PF-DEV_node1 you might actually have a leaf like Tomcat10 or Tomcat10-PF-DEV_node1 – we need to confirm.
+
+You are checking version somewhere else (for example under Procrun 2.0 or via service GUI), which reads a different registry value.
+
+3. What to check on one server
+On the target instance, run this in an elevated PowerShell:
+
+powershell
+# 1) Find all Tomcat registry keys with Version/InstallPath
+Get-ChildItem "HKLM:\SOFTWARE\Apache Software Foundation\Tomcat" -Recurse |
+  Get-ItemProperty -ErrorAction SilentlyContinue |
+  Where-Object { $_.PSObject.Properties.Name -contains 'Version' } |
+  Select-Object PSPath, Version, InstallPath
+
+# 2) Also check WOW6432Node in case Tomcat is 32-bit
+Get-ChildItem "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Tomcat" -Recurse |
+  Get-ItemProperty -ErrorAction SilentlyContinue |
+  Where-Object { $_.PSObject.Properties.Name -contains 'Version' } |
+  Select-Object PSPath, Version, InstallPath
+This will show you the exact key path and what Version/InstallPath are set to for your service.
+
+Share one of the PSPath values you see and we can adjust the runbook precisely.
+
+4. Minimal change you can do now
+Once you know the real path, change the registry section in the document. For example, if you find:
+
+HKLM\SOFTWARE\WOW6432Node\Apache Software Foundation\Tomcat\10.1\Tomcat10-PF-DEV_node1
+
+then change the script block to:
+
+powershell
+# Use actual path
+$regPath = "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Tomcat\10.1\Tomcat10-PF-DEV_node1"
+
+Write-Info "Updating registry at '$regPath' with Version='$version' and InstallPath='$tomcatDir'."
+if (-not $IsDryRun) {
+  Set-ItemProperty -Path $regPath -Name 'Version'     -Value $version -Force
+  Set-ItemProperty -Path $regPath -Name 'InstallPath' -Value $tomcatDir -Force
+}
+Once this matches your actual key, rerun the Automation with dryRun = false and the version value should move to 10.1.50 under that key.
+
+Follow-ups
+
+How to check Tomcat version in Windows registry for Tomcat10-PF-DEV_node1
+
+What SSM commands update Tomcat service version in registry
+
+How to restart Tomcat10-PF-DEV_node1 service after SSM
+
+How to uninstall old Tomcat service before new install
+
+Why does Tomcat show old version after successful deployment to D:/apps
