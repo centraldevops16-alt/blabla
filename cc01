@@ -1,0 +1,151 @@
+Create a cloud custodian policy to delete all not in use ECS task definitions for specific template. Add a flag to consider the definitions older than x day, if flag not passed, delete all definitions except active ones.
+You can do this with an aws.ecs-task-definition policy that (a) filters to your template family, (b) optionally filters by age, and (c) excludes the active revision, then deletes the rest.
+
+Below is a pattern you can parameterize with a “days” flag at run time (e.g., vars via CLI or Jinja):
+
+text
+vars:
+  # Pass this from CLI/env; if empty -> delete all non-active
+  # Example: custodian run -s out -v days=30 ecs-td-cleanup.yml
+  days: ''
+
+policies:
+  - name: ecs-task-def-cleanup-for-template
+    resource: aws.ecs-task-definition
+    description: |
+      Delete ECS task definitions for a specific template family
+      that are not the currently active revision. If "days" is set (>0),
+      only delete definitions older than that many days.
+    filters:
+      # 1) Only this template / family
+      - type: value
+        key: family
+        op: eq
+        value: my-template-family               # <-- your template name
+
+      # 2) Exclude the currently active revision
+      #    This keeps the latest ACTIVE TD for that family.
+      - type: reduce
+        sort-by:
+          key: revision
+          value_type: integer
+        order: desc
+        limit: 1
+        op: difference
+
+      # 3) Optional age filter: only when "days" is set
+      - or:
+          - and:
+              - type: value
+                key: registrationDate
+                value_type: age
+                op: gt
+                value: 0
+              - type: value
+                key: registrationDate
+                value_type: age
+                op: gt
+                value: "{{ days | int }}"
+          # If days is empty or 0, this branch will not match anything,
+          # so you effectively delete all non-active definitions.
+
+    actions:
+      - type: delete
+        # force: true      # optional – deregister vs permanent delete[web:1]
+How it behaves:
+
+When days is not provided or set to 0:
+The age filter does not effectively restrict the set, so all non-active task definitions for my-template-family are deleted (active one kept).
+
+When days is set to X (e.g., 30):
+Only task definitions for my-template-family that are older than X days and are not the latest active revision are deleted.
+
+If you prefer not to use templating and want two explicit modes instead, I can rewrite this into two separate policies (one “delete all non-active” and one “delete older than X days”) wired to different Cloud Custodian runs; would that fit your workflow better?
+
+rewrite this into two separate policies (one “delete all non-active” and one “delete older than X days”) wired to different Cloud Custodian runs
+Here are two explicit policies, each wired to its own run, so you can call them separately from your pipelines or schedulers.
+
+Policy 1 – Delete all non‑active task definitions for a template
+This policy keeps the latest ACTIVE revision for the given family and deletes all older revisions (regardless of age).
+
+text
+policies:
+  - name: ecs-td-delete-all-non-active
+    resource: aws.ecs-task-definition
+    description: |
+      Delete all non-active ECS task definition revisions for a given family.
+      Keeps only the latest ACTIVE revision.
+
+    filters:
+      # Limit to specific template / family
+      - type: value
+        key: family
+        op: eq
+        value: my-template-family      # <-- your template name
+
+      # Remove the latest revision (assumed active) from the candidate set
+      - type: reduce
+        sort-by:
+          key: revision
+          value_type: integer
+        order: desc
+        limit: 1
+        op: difference
+
+    actions:
+      - type: delete                  # deregister or delete based on your need
+        # force: true                 # uncomment to permanently delete[web:1]
+You would run this with something like:
+
+bash
+custodian run -s out ecs-td-delete-all-non-active.yml
+Policy 2 – Delete non‑active task definitions older than X days
+This policy deletes only non‑active revisions for the family that are older than a given age threshold, using registrationDate with value_type: age.
+
+text
+policies:
+  - name: ecs-td-delete-old-non-active
+    resource: aws.ecs-task-definition
+    description: |
+      Delete ECS task definition revisions for a given family that are not
+      the latest ACTIVE revision and are older than X days.
+
+    filters:
+      # Limit to specific template / family
+      - type: value
+        key: family
+        op: eq
+        value: my-template-family      # <-- your template name
+
+      # Remove the latest revision (assumed active) from the candidate set
+      - type: reduce
+        sort-by:
+          key: revision
+          value_type: integer
+        order: desc
+        limit: 1
+        op: difference
+
+      # Only those older than X days (e.g., 30)
+      - type: value
+        key: registrationDate
+        value_type: age
+        op: gt
+        value: 30                      # <-- your X days
+
+    actions:
+      - type: delete
+        # force: true                  # optional permanent delete[web:1]
+You would run this from a separate workflow or schedule, for example:
+
+bash
+custodian run -s out ecs-td-delete-old-non-active.yml
+If your “specific template” selection is more complex than just matching the family (for example, by tags or container image name within the task definition), do you want to match on family alone or on some other field as well?
+
+Follow-ups
+
+Family name filter is enough for now
+
+Need to filter by container image tag
+
+Need to filter by custom tag on TD
