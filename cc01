@@ -1,13 +1,3 @@
-$Installer = "C:\Softwares\Qualys\Windows\QualysCloudAgent.exe"
-$ArgumentList = @(
-    "CustomerId={xxxxxxxxxxx}",
-    "ActivationId={xxxxxxxxxx}",
-    "WebServiceUri=https://qapublic.qg3.apps.qualys.com/CloudAgent/"
-)
-
-$ArgumentList | ForEach-Object { Write-Host "Arg item: $_" }
-
-Start-Process -FilePath $Installer -ArgumentList $ArgumentList -Wait -Verb RunAs
 
 
 Create a cloud custodian policy to delete all not in use ECS task definitions for specific template. Add a flag to consider the definitions older than x day, if flag not passed, delete all definitions except active ones.
