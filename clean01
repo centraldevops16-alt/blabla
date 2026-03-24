@@ -1,0 +1,136 @@
+I don't want to run it via script, provide individual steps seperately
+Completed 1 step
+Here are standalone Console/CLI steps for S3 cleanup—no script needed. Copy-paste commands.
+
+Prerequisites (Console/CLI)
+1. Create Inventory Bucket (Console: S3 > Create bucket; CLI):
+
+text
+aws s3 mb s3://your-unique-cleanup-inventory-$(date +%s) --region us-east-1
+export INV_BUCKET=your-unique-cleanup-inventory-123
+2. Create Batch Ops IAM Role (Console: IAM > Create role > S3 > Batch Operations):
+
+Name: S3BatchCleanupRole
+
+Policy: Custom with s3:DeleteObject, s3:GetObject* on *
+
+Export ARN:
+
+text
+export BATCH_ROLE_ARN=arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/S3BatchCleanupRole
+Step 1: Enable S3 Inventory on Matching Buckets (Console/CLI, 5 mins)
+Find buckets:
+
+text
+aws s3api list-buckets --query "Buckets[?contains(Name, \`access-logs\`) || contains(Name, \`athena-logs\`)].Name" --output table
+Console (per bucket):
+
+S3 > [bucket] > Management > Inventory configurations > Create.
+
+Id: cleanup-inv-1
+
+Status: Enabled
+
+Frequency: Weekly
+
+Report: Parquet, Optional: Size/LastModifiedDate/StorageClass/ETag
+
+Destination: $INV_BUCKET (arn:aws:s3:::$INV_BUCKET/inventory)
+
+CLI (loop):
+
+text
+for bucket in $(aws s3api list-buckets --query "Buckets[?contains(Name, \`access-logs\`) || contains(Name, \`athena-logs\`)].Name[]" --output text); do
+  aws s3api put-bucket-inventory-configuration --bucket $bucket --inventory-configuration '{
+    "Id": "cleanup-inv-1",
+    "IsEnabled": true,
+    "Destination": {"S3BucketDestination": {"AccountId": "'$(aws sts get-caller-identity --query Account --output text)'", "Format": "Parquet", "Bucket": "arn:aws:s3:::'$INV_BUCKET'"}},
+    "Schedule": {"Frequency": "Weekly"},
+    "IncludedObjectVersions": "Current",
+    "OptionalFields": ["Size", "LastModifiedDate", "StorageClass"]
+  }'
+done
+Wait: 24-48h. Verify: aws s3 ls $INV_BUCKET/inventory/ --recursive
+
+Step 2: Setup Athena Table (Console/CLI, 5 mins)
+Console:
+
+Athena > Query editor > New DB: s3_cleanup.
+
+Validation query:
+
+text
+CREATE EXTERNAL TABLE IF NOT EXISTS s3_cleanup.s3_inventory (
+  bucket string, key string, versionId string, isLatest boolean, isDeleteMarker boolean,
+  size bigint, lastModifiedDate bigint, eTag string, storageClass string,
+  encryptionStatus string
+)
+PARTITIONED BY (configId string, reportDate string)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+LOCATION 's3://$INV_BUCKET/inventory/'
+TBLPROPERTIES ('parquet.compress'='SNAPPY');
+Run MSCK REPAIR TABLE s3_cleanup.s3_inventory;
+
+CLI:
+
+text
+aws athena start-query-execution --query-string "CREATE DATABASE IF NOT EXISTS s3_cleanup;"
+aws athena start-query-execution --query-string "CREATE EXTERNAL TABLE ... " --query-execution-context Database=s3_cleanup --result-configuration OutputLocation=s3://$INV_BUCKET/athena/
+aws athena start-query-execution --query-string "MSCK REPAIR TABLE s3_cleanup.s3_inventory;" --query-execution-context Database=s3_cleanup
+Verify: SELECT count(*) FROM s3_cleanup.s3_inventory LIMIT 10;
+
+Step 3: Query & Export Manifest (Console, 10 mins)
+Athena Query (adjust date):
+
+text
+SELECT bucket, key
+FROM s3_cleanup.s3_inventory
+WHERE (bucket LIKE '%access-logs%' OR bucket LIKE '%athena-logs%')
+  AND storageClass = 'STANDARD'
+  AND from_unixtime(lastModifiedDate/1000) < date('2025-09-01')
+  AND isLatest = true AND isDeleteMarker = false
+Run > Download CSV (rename columns to Bucket,Key; save as manifest.csv).
+
+Upload: aws s3 cp manifest.csv s3://$INV_BUCKET/manifests/cleanup-manifest.csv
+Count first: Add LIMIT 10 for test.
+
+Step 4: Create Batch Delete Job (Console, 2 mins)
+Console:
+
+S3 > Management tab > Batch operations > Create job.
+
+Manifest: CSV format > Browse s3://$INV_BUCKET/manifests/cleanup-manifest.csv
+
+Operation: Delete objects (no Lambda).
+
+IAM role: Select S3BatchCleanupRole.
+
+Report: s3://$INV_BUCKET/batch-reports/ (CSV).
+
+Priority: 10 (High).
+
+Create > Monitor in Batch operations list.
+
+CLI:
+
+text
+aws s3control create-job --account-id $(aws sts get-caller-identity --query Account --output text) \
+  --operation '{"S3DeleteObject": {}}' \
+  --manifest '{"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": ["Bucket","Key"]}, "Location": {"ObjectArn": "arn:aws:s3:::'$INV_BUCKET'/manifests/cleanup-manifest.csv", "ETag": "'$(aws s3api head-object --bucket $INV_BUCKET --key manifests/cleanup-manifest.csv --query ETag --output text)'"}}' \
+  --report '{"Bucket": "arn:aws:s3:::'$INV_BUCKET'", "Format": "Report_CSV_20180820", "Enabled": true, "Prefix": "batch-reports/", "ReportScope": "AllTasks"}' \
+  --priority 10 --role-arn $BATCH_ROLE_ARN
+Monitor: S3 Console > Batch ops > Jobs.
+
+Step 5: Monitor & Verify (Console)
+Job status: S3 > Batch operations > [JobId] > Tasks (progress %).
+
+Reports: aws s3 ls s3://$INV_BUCKET/batch-reports/JOB_ID/ --recursive
+
+output.csv: Successes.
+
+unprocessedmanifest.csv: Failures (retry if needed).
+
+Cancel if test: Batch ops > Job > Cancel.
+
+Test Flow: Step1 on 1 bucket > Step2-4 with LIMIT 10. Scales to 100M+ automatically.
+
