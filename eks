@@ -1,0 +1,72 @@
+To restore EKS node groups to their previous scaling state on startup, modify the shutdown policy to save original minSize, desiredSize, and maxSize to tags before scaling down.
+
+The startup policy then reads these tags and restores the values exactly.
+
+This uses Cloud Custodian's save-options-tag and restore-options-tag in the resize action, adapted for eks-nodegroup's set-scaling-config.
+
+Updated Shutdown Policy (Friday)
+Save originals to tags like CustodianMinSize, CustodianDesiredSize, CustodianMaxSize.
+
+text
+policies:
+  - name: eks-nodegroup-shutdown-weekend
+    resource: aws.eks-nodegroup
+    filters:
+      - tag:custodian-weekend-off: true
+      - type: value
+        key: scalingConfig.minSize
+        value: 0
+        op: eq
+    actions:
+      - type: set-scaling-config
+        save-options-tag: CustodianOriginalScaling
+        minSize: 0
+        desiredSize: 0
+        maxSize: present
+Runs Friday evening.
+
+Updated Startup Policy (Monday)
+Restores from saved tags.
+
+text
+policies:
+  - name: eks-nodegroup-startup-weekdays
+    resource: aws.eks-nodegroup
+    filters:
+      - tag:custodian-weekend-off: true
+      - "tag:CustodianMinSize": present  # Ensures tags exist (scaled down)
+    actions:
+      - type: set-scaling-config
+        restore-options-tag: CustodianOriginalScaling
+        maxSize: present  # Preserves if not saved, but should be tagged
+Runs Monday morning. Cluster Autoscaler can then adjust desiredSize as needed.
+
+Notes
+Requires Cloud Custodian version supporting tag save/restore on eks-nodegroup (check docs or test).
+
+Test with --dryrun; ensure node groups allow minSize=0.
+
+If using self-managed nodes, target aws.asg instead.
+
+Do your node groups use Cluster Autoscaler?
+
+what is the use of CustodianMinSize?
+CustodianMinSize stores the original minimum size value from the EKS node group's scaling config before the weekend shutdown.
+
+In the save-options-tag: CustodianOriginalScaling mechanism (adapted from ASG resize), Cloud Custodian automatically saves the prior minSize, desiredSize, and maxSize values into tags like CustodianMinSize, CustodianDesiredSize, and CustodianMaxSize.
+
+The startup policy's restore-options-tag then reads these exact values to revert scaling precisely, avoiding hardcoded assumptions about normal capacity.
+
+Tag Format
+These tags follow Cloud Custodian's convention:
+
+CustodianMinSize: "2" (string value of original minSize)
+
+CustodianDesiredSize: "3"
+
+CustodianMaxSize: "10"
+
+Saved only during shutdown; startup consumes and applies them.
+
+Why Tags Over Hardcoding?
+Handles dynamic environments where admins adjust scaling mid-week. Ensures idempotency if policy runs multiple times.
