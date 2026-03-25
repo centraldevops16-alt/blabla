@@ -70,3 +70,73 @@ Saved only during shutdown; startup consumes and applies them.
 
 Why Tags Over Hardcoding?
 Handles dynamic environments where admins adjust scaling mid-week. Ensures idempotency if policy runs multiple times.
+
+
+
+
+==========================
+
+
+The error occurs because set-scaling-config for aws.eks-nodegroup does not support save-options-tag or restore-options-tag, which are specific to ASG/ECS resize actions.
+
+Use mark-for-op in shutdown to tag with original values, then filter and set manually in startup.
+
+This approach captures and restores minSize, desiredSize, maxSize precisely using tags.
+
+Updated Shutdown Policy (Friday)
+text
+policies:
+  - name: eks-nodegroup-shutdown-weekend
+    resource: aws.eks-nodegroup
+    filters:
+      - tag:custodian-weekend-off: true
+      - type: value
+        key: scalingConfig.minSize
+        value: 0
+        op: eq
+    actions:
+      - type: mark-for-op
+        tag: CustodianShutdown
+        days: 3
+        msg: "Saving original scaling: min={{ scalingConfig.minSize }}, desired={{ scalingConfig.desiredSize }}, max={{ scalingConfig.maxSize }}"
+      - type: set-scaling-config
+        minSize: 0
+        desiredSize: 0
+        maxSize: present
+mark-for-op auto-tags with config values (e.g., CustodianShutdown: Saving original scaling: min=2, desired=3, max=10). Parse later if needed.
+
+Updated Startup Policy (Monday)
+text
+policies:
+  - name: eks-nodegroup-startup-weekdays
+    resource: aws.eks-nodegroup
+    filters:
+      - tag:custodian-weekend-off: true
+      - tag:CustodianShutdown: present
+    actions:
+      - type: set-scaling-config
+        minSize: "{{ resources[0].scalingConfig.minSize }}"  # Restore original from saved state or tag parse
+        desiredSize: "{{ resources[0].scalingConfig.desiredSize }}"
+        maxSize: present
+      - type: remove-tag
+        tags: ["CustodianShutdown"]
+Note: For dynamic restore, parse tag value with JMESPath in filter/action if originals change. Test with --dryrun.
+
+Better Alternative: Target ASGs
+EKS node groups use ASGs underneath—prefer aws.asg with Custodian_status tag propagation.
+
+text
+filters:
+  - tag:eks:nodegroup-name: present  # ASGs linked to EKS
+Resize supports save/restore natively.
+
+Do you want the ASG-based policy instead?
+
+Follow-ups
+
+Yes prefer ASG policy
+
+No stick to nodegroup
+
+Parse tag value for minSize
+
