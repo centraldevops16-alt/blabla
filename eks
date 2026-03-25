@@ -140,3 +140,66 @@ No stick to nodegroup
 
 Parse tag value for minSize
 
+
+
+================================================================================
+
+tag eks:nodegroup-name and eks:cluster-name identifies EKS ASGs
+EKS managed node groups automatically tag their underlying ASGs with eks:cluster-name and eks:nodegroup-name, perfect for precise filtering.
+
+Updated ASG policies now use both tags for accuracy, plus your CustodianShutdown: true opt-in tag.
+
+Final Shutdown Policy (Friday 6 PM)
+text
+policies:
+  - name: eks-asg-shutdown-weekend
+    resource: aws.asg
+    filters:
+      - tag:CustodianShutdown: true
+      - tag:eks:cluster-name: present
+      - tag:eks:nodegroup-name: present
+    actions:
+      - type: resize
+        save-options-tag: CustodianOriginalASG
+        min: 0
+        desired: 0
+Schedules via Lambda cron: cron(0 18 ? * FRI *).
+
+Final Startup Policy (Monday 9 AM)
+text
+policies:
+  - name: eks-asg-startup-weekdays
+    resource: aws.asg
+    filters:
+      - tag:CustodianShutdown: true
+      - tag:eks:cluster-name: present
+      - tag:eks:nodegroup-name: present
+      - tag:CustodianMinSize: present  # Confirms shutdown occurred
+    actions:
+      - type: resize
+        restore-options-tag: CustodianOriginalASG
+Schedules via Lambda cron: cron(0 9 ? * MON *).
+
+Quick Setup
+Tag target ASGs: CustodianShutdown: true (appears automatically on EKS ASGs).
+
+Save as eks-asg-weekend.yml.
+
+Test: custodian run -s logs/ --dryrun eks-asg-weekend.yml
+
+Deploy to Lambda with IAM: autoscaling:UpdateAutoScalingGroup, autoscaling:Describe*.
+
+Cluster Autoscaler will handle pod rescheduling after Monday scale-up. Ready to deploy?
+
+Follow-ups
+
+AWS CLI command to list ASGs by eks cluster and nodegroup tags
+
+Cloud Custodian policy to match EKS ASGs using these tags
+
+Terraform code to propagate custom tags to EKS ASG
+
+Do all EKS nodegroup tags propagate to ASG
+
+How to query ASG name from eks:nodegroup-name tag
+
