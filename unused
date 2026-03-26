@@ -1,0 +1,52 @@
+#!/bin/bash
+
+share_arns=$(aws storagegateway list-file-shares --query 'FileShareInfoList[].FileShareARN' --output text)
+
+for arn in $share_arns; do
+  share_id=$(echo "$arn" | awk -F'/' '{print $2}')
+
+  # Query DataRead and FileIOS over 14 days
+  resp=$(aws cloudwatch get-metric-data \
+    --metric-data-queries '[
+      {
+        "Id": "dataread",
+        "MetricStat": {
+          "Metric": {
+            "Namespace": "AWS/StorageGateway",
+            "MetricName": "DataRead",
+            "Dimensions": [
+              { "Name": "FileShareId", "Value": "'"$share_id"'" }
+            ]
+          },
+          "Period": 3600,
+          "Stat": "Sum"
+        }
+      },
+      {
+        "Id": "fileios",
+        "MetricStat": {
+          "Metric": {
+            "Namespace": "AWS/StorageGateway",
+            "MetricName": "FileIOS",
+            "Dimensions": [
+              { "Name": "FileShareId", "Value": "'"$share_id"'" }
+            ]
+          },
+          "Period": 3600,
+          "Stat": "Sum"
+        }
+      }
+    ]' \
+    --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
+    --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
+    --output json)
+
+  # Extract max value for each metric; treat null as 0
+  max_dataread=$(echo "$resp" | jq -r '.MetricDataResults[] | select(.Id=="dataread") | .Values | map(.//0) | max // 0')
+  max_fileios=$(echo "$resp" | jq -r '.MetricDataResults[] | select(.Id=="fileios") | .Values | map(.//0) | max // 0')
+
+  # Treat as unused only if both metrics are 0
+  if (( $(echo "$max_dataread == 0" | bc -l) )) && (( $(echo "$max_fileios == 0" | bc -l) )); then
+    echo "UNUSED (no DataRead + no FileIOS in last 14d): $arn"
+  fi
+done
