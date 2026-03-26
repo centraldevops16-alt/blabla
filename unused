@@ -1,70 +1,108 @@
 #!/bin/bash
 
-# Get all file-share ARNs
-aws storagegateway list-file-shares \
-  --query 'FileShareInfoList[].FileShareARN' \
+#
+# Single region, single account only
+#
+
+# Set your region here (edit this line)
+region="ap-south-1"
+
+# Temporary metric‑data JSON file
+query_file="metric-data-query.json"
+
+echo "=== REGION: $region (single account, single region) ==="
+
+# List all gateways in this region
+aws storagegateway list-gateways \
+  --region "$region" \
+  --query 'Gateways[].GatewayARN' \
   --output text |
-  while read -r arn; do
-    if [ -z "$arn" ]; then
+  while read -r gw_arn; do
+    if [ -z "$gw_arn" ]; then
       continue
     fi
 
-    share_id=$(echo "$arn" | awk -F'/' '{print $2}')
+    echo "GATEWAY: $gw_arn"
 
-    # Query both ReadBytes and WriteBytes for this file share
-    resp=$(aws cloudwatch get-metric-data \
-      --metric-data-queries '[
-        {
-          "Id": "readbytes",
-          "MetricStat": {
-            "Metric": {
-              "Namespace": "AWS/StorageGateway",
-              "MetricName": "ReadBytes",
-              "Dimensions": [
-                { "Name": "FileShareId", "Value": "'"$share_id"'" }
-              ]
-            },
-            "Period": 3600,
-            "Stat": "Sum"
-          }
-        },
-        {
-          "Id": "writebytes",
-          "MetricStat": {
-            "Metric": "AWS/StorageGateway",
-            "MetricName": "WriteBytes",
-            "Dimensions": [
-              { "Name": "FileShareId", "Value": "'"$share_id"'" }
-            ]
-          },
-          "Period": 3600,
-          "Stat": "Sum"
-        }
-      ]' \
-      --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
-      --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
-      --output json)
+    # List all file shares under this gateway
+    aws storagegateway list-file-shares \
+      --region "$region" \
+      --gateway-arn "$gw_arn" \
+      --query 'FileShareInfoList[].FileShareARN' \
+      --output text |
+      while read -r arn; do
+        if [ -z "$arn" ]; then
+          continue
+        fi
 
-    # Extract max value for ReadBytes (fallback to 0)
-    max_read=$(echo "$resp" | \
-      grep '"Id":"readbytes"' -A 10 | \
-      grep -E 'Values' | \
-      grep -E '\[.*\]' | \
-      grep -E -o '[0-9]+(\.[0-9]+)?' | \
-      sort -n | tail -1 | head -1)
-    max_read=${max_read:-0}
+        share_id=$(echo "$arn" | awk -F'/' '{print $NF}')
 
-    # Extract max value for WriteBytes (fallback to 0)
-    max_write=$(echo "$resp" | \
-      grep '"Id":"writebytes"' -A 10 | \
-      grep -E 'Values' | \
-      grep -E '\[.*\]' | \
-      grep -E -o '[0-9]+(\.[0-9]+)?' | \
-      sort -n | tail -1 | head -1)
-    max_write=${max_write:-0}
+        # Write metric‑data query JSON for this file share
+        cat > "$query_file" << EOF
+[
+  {
+    "Id": "readbytes",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/StorageGateway",
+        "MetricName": "ReadBytes",
+        "Dimensions": [
+          { "Name": "FileShareId", "Value": "$share_id" }
+        ]
+      },
+      "Period": 3600,
+      "Stat": "Sum"
+    }
+  },
+  {
+    "Id": "writebytes",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/StorageGateway",
+        "MetricName": "WriteBytes",
+        "Dimensions": [
+          { "Name": "FileShareId", "Value": "$share_id" }
+        ]
+      },
+      "Period": 3600,
+      "Stat": "Sum"
+    }
+  }
+]
+EOF
 
-    # If both metrics are 0, treat as unused
-    if (( $(echo "$max_read == 0" | bc -l) )) && (( $(echo "$max_write == 0" | bc -l) )); then
-      echo "UNUSED (no ReadBytes + no WriteBytes in last 14d): $arn"
-    fi
+        # Query CloudWatch for this file share
+        resp=$(aws cloudwatch get-metric-data \
+          --region "$region" \
+          --metric-data-queries "file://$PWD/$query_file" \
+          --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
+          --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
+          --output json)
+
+        # Extract max ReadBytes (fallback to 0)
+        max_read=$(echo "$resp" | \
+          grep '"Id":"readbytes"' -A 10 | \
+          grep -E 'Values' | \
+          grep -E '\[.*\]' | \
+          grep -E -o '[0-9]+' | \
+          sort -n | tail -1 | head -1)
+        max_read=${max_read:-0}
+
+        # Extract max WriteBytes (fallback to 0)
+        max_write=$(echo "$resp" | \
+          grep '"Id":"writebytes"' -A 10 | \
+          grep -E 'Values' | \
+          grep -E '\[.*\]' | \
+          grep -E -o '[0-9]+' | \
+          sort -n | tail -1 | head -1)
+        max_write=${max_write:-0}
+
+        # Mark as unused if both metrics are 0 (integer only)
+        if [ "$max_read" -eq 0 ] && [ "$max_write" -eq 0 ]; then
+          echo "UNUSED (no ReadBytes + no WriteBytes in last 14d): $arn"
+        fi
+      done
   done
+
+# Cleanup
+rm -f metric-data-query.json
