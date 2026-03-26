@@ -1,19 +1,38 @@
 #!/bin/bash
 
-share_arns=$(aws storagegateway list-file-shares --query 'FileShareInfoList[].FileShareARN' --output text)
+# Get all file-share ARNs
+aws storagegateway list-file-shares \
+  --query 'FileShareInfoList[].FileShareARN' \
+  --output text |
+  while read -r arn; do
+    if [ -z "$arn" ]; then
+      continue
+    fi
 
-for arn in $share_arns; do
-  share_id=$(echo "$arn" | awk -F'/' '{print $2}')
+    share_id=$(echo "$arn" | awk -F'/' '{print $2}')
 
-  # Query DataRead and FileIOS over 14 days
-  resp=$(aws cloudwatch get-metric-data \
-    --metric-data-queries '[
-      {
-        "Id": "dataread",
-        "MetricStat": {
-          "Metric": {
-            "Namespace": "AWS/StorageGateway",
-            "MetricName": "DataRead",
+    # Query both ReadBytes and WriteBytes for this file share
+    resp=$(aws cloudwatch get-metric-data \
+      --metric-data-queries '[
+        {
+          "Id": "readbytes",
+          "MetricStat": {
+            "Metric": {
+              "Namespace": "AWS/StorageGateway",
+              "MetricName": "ReadBytes",
+              "Dimensions": [
+                { "Name": "FileShareId", "Value": "'"$share_id"'" }
+              ]
+            },
+            "Period": 3600,
+            "Stat": "Sum"
+          }
+        },
+        {
+          "Id": "writebytes",
+          "MetricStat": {
+            "Metric": "AWS/StorageGateway",
+            "MetricName": "WriteBytes",
             "Dimensions": [
               { "Name": "FileShareId", "Value": "'"$share_id"'" }
             ]
@@ -21,32 +40,31 @@ for arn in $share_arns; do
           "Period": 3600,
           "Stat": "Sum"
         }
-      },
-      {
-        "Id": "fileios",
-        "MetricStat": {
-          "Metric": {
-            "Namespace": "AWS/StorageGateway",
-            "MetricName": "FileIOS",
-            "Dimensions": [
-              { "Name": "FileShareId", "Value": "'"$share_id"'" }
-            ]
-          },
-          "Period": 3600,
-          "Stat": "Sum"
-        }
-      }
-    ]' \
-    --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
-    --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
-    --output json)
+      ]' \
+      --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
+      --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
+      --output json)
 
-  # Extract max value for each metric; treat null as 0
-  max_dataread=$(echo "$resp" | jq -r '.MetricDataResults[] | select(.Id=="dataread") | .Values | map(.//0) | max // 0')
-  max_fileios=$(echo "$resp" | jq -r '.MetricDataResults[] | select(.Id=="fileios") | .Values | map(.//0) | max // 0')
+    # Extract max value for ReadBytes (fallback to 0)
+    max_read=$(echo "$resp" | \
+      grep '"Id":"readbytes"' -A 10 | \
+      grep -E 'Values' | \
+      grep -E '\[.*\]' | \
+      grep -E -o '[0-9]+(\.[0-9]+)?' | \
+      sort -n | tail -1 | head -1)
+    max_read=${max_read:-0}
 
-  # Treat as unused only if both metrics are 0
-  if (( $(echo "$max_dataread == 0" | bc -l) )) && (( $(echo "$max_fileios == 0" | bc -l) )); then
-    echo "UNUSED (no DataRead + no FileIOS in last 14d): $arn"
-  fi
-done
+    # Extract max value for WriteBytes (fallback to 0)
+    max_write=$(echo "$resp" | \
+      grep '"Id":"writebytes"' -A 10 | \
+      grep -E 'Values' | \
+      grep -E '\[.*\]' | \
+      grep -E -o '[0-9]+(\.[0-9]+)?' | \
+      sort -n | tail -1 | head -1)
+    max_write=${max_write:-0}
+
+    # If both metrics are 0, treat as unused
+    if (( $(echo "$max_read == 0" | bc -l) )) && (( $(echo "$max_write == 0" | bc -l) )); then
+      echo "UNUSED (no ReadBytes + no WriteBytes in last 14d): $arn"
+    fi
+  done
