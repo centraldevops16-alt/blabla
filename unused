@@ -1,44 +1,41 @@
 #!/bin/bash
 
 #
-# Single region, single account only
+# Single account, single region, exactly 2 gateways (hardcoded)
 #
 
-# Set your region here (edit this line)
-region="ap-south-1"
+region="ap-south-1"   # edit as needed
 
-# Temporary metric‑data JSON file
+# Hardcode your two gateway ARNs here
+gateway_arns=(
+  "arn:aws:storagegateway:ap-south-1:123456789012:gateway/sgw-12345678"
+  "arn:aws:storagegateway:ap-south-1:123456789012:gateway/sgw-87654321"
+)
+
 query_file="metric-data-query.json"
+tmp_file="/tmp/storagegateway.shares.$$"
 
-echo "=== REGION: $region (single account, single region) ==="
+echo "=== REGION: $region (2 gateways, hardcoded) ==="
 
-# List all gateways in this region
-aws storagegateway list-gateways \
-  --region "$region" \
-  --query 'Gateways[].GatewayARN' \
-  --output text |
-  while read -r gw_arn; do
-    if [ -z "$gw_arn" ]; then
+for gw_arn in "${gateway_arns[@]}"; do
+  echo "GATEWAY: $gw_arn"
+
+  # List all file shares for this gateway
+  aws storagegateway list-file-shares \
+    --region "$region" \
+    --gateway-arn "$gw_arn" \
+    --query 'FileShareInfoList[].FileShareARN' \
+    --output text > "$tmp_file"
+
+  while IFS= read -r arn; do
+    if [ -z "$arn" ]; then
       continue
     fi
 
-    echo "GATEWAY: $gw_arn"
+    share_id=$(echo "$arn" | awk -F'/' '{print $NF}')
 
-    # List all file shares under this gateway
-    aws storagegateway list-file-shares \
-      --region "$region" \
-      --gateway-arn "$gw_arn" \
-      --query 'FileShareInfoList[].FileShareARN' \
-      --output text |
-      while read -r arn; do
-        if [ -z "$arn" ]; then
-          continue
-        fi
-
-        share_id=$(echo "$arn" | awk -F'/' '{print $NF}')
-
-        # Write metric‑data query JSON for this file share
-        cat > "$query_file" << EOF
+    # Write metric-data query JSON for this file share
+    cat > "$query_file" << EOF
 [
   {
     "Id": "readbytes",
@@ -71,38 +68,37 @@ aws storagegateway list-gateways \
 ]
 EOF
 
-        # Query CloudWatch for this file share
-        resp=$(aws cloudwatch get-metric-data \
-          --region "$region" \
-          --metric-data-queries "file://$PWD/$query_file" \
-          --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
-          --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
-          --output json)
+    resp=$(aws cloudwatch get-metric-data \
+      --region "$region" \
+      --metric-data-queries "file://$PWD/$query_file" \
+      --start-time "$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z)" \
+      --end-time "$(date -u +%Y-%m-%dT23:59:59Z)" \
+      --output json)
 
-        # Extract max ReadBytes (fallback to 0)
-        max_read=$(echo "$resp" | \
-          grep '"Id":"readbytes"' -A 10 | \
-          grep -E 'Values' | \
-          grep -E '\[.*\]' | \
-          grep -E -o '[0-9]+' | \
-          sort -n | tail -1 | head -1)
-        max_read=${max_read:-0}
+    # ReadBytes
+    max_read=$(echo "$resp" | \
+      grep '"Id":"readbytes"' -A 10 | \
+      grep -E 'Values' | \
+      grep -E '\[.*\]' | \
+      grep -E -o '[0-9]+' | \
+      sort -n | tail -1 | head -1)
+    max_read=${max_read:-0}
 
-        # Extract max WriteBytes (fallback to 0)
-        max_write=$(echo "$resp" | \
-          grep '"Id":"writebytes"' -A 10 | \
-          grep -E 'Values' | \
-          grep -E '\[.*\]' | \
-          grep -E -o '[0-9]+' | \
-          sort -n | tail -1 | head -1)
-        max_write=${max_write:-0}
+    # WriteBytes
+    max_write=$(echo "$resp" | \
+      grep '"Id":"writebytes"' -A 10 | \
+      grep -E 'Values' | \
+      grep -E '\[.*\]' | \
+      grep -E -o '[0-9]+' | \
+      sort -n | tail -1 | head -1)
+    max_write=${max_write:-0}
 
-        # Mark as unused if both metrics are 0 (integer only)
-        if [ "$max_read" -eq 0 ] && [ "$max_write" -eq 0 ]; then
-          echo "UNUSED (no ReadBytes + no WriteBytes in last 14d): $arn"
-        fi
-      done
-  done
+    if [ "$max_read" -eq 0 ] && [ "$max_write" -eq 0 ]; then
+      echo "UNUSED (no ReadBytes + no WriteBytes in last 14d): $arn"
+    fi
+  done < "$tmp_file"
+
+done
 
 # Cleanup
-rm -f metric-data-query.json
+rm -f "$tmp_file" metric-data-query.json
