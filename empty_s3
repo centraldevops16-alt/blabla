@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+
+DEFAULT_REGION = "us-east-1"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Empty all S3 buckets whose name ends with a given suffix."
+    )
+    parser.add_argument(
+        "--suffix",
+        default="-test-bucket",
+        help="Bucket name suffix to match. Default: -test-bucket",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only print matching buckets and planned actions.",
+    )
+    return parser.parse_args()
+
+
+def get_s3_client():
+    return boto3.client("s3", region_name=DEFAULT_REGION)
+
+
+def get_matching_buckets(s3, suffix):
+    response = s3.list_buckets()
+    return [b["Name"] for b in response.get("Buckets", []) if b["Name"].endswith(suffix)]
+
+
+def delete_current_objects(s3, bucket, dry_run):
+    deleted = 0
+    continuation_token = None
+
+    while True:
+        params = {"Bucket": bucket, "MaxKeys": 1000}
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+
+        response = s3.list_objects_v2(**params)
+        objects = [{"Key": obj["Key"]} for obj in response.get("Contents", [])]
+
+        if objects:
+            if dry_run:
+                deleted += len(objects)
+            else:
+                result = s3.delete_objects(
+                    Bucket=bucket,
+                    Delete={"Objects": objects, "Quiet": True},
+                )
+                deleted += len(result.get("Deleted", []))
+
+        if not response.get("IsTruncated"):
+            break
+
+        continuation_token = response.get("NextContinuationToken")
+
+    return deleted
+
+
+def delete_versions_and_markers(s3, bucket, dry_run):
+    deleted = 0
+    key_marker = None
+    version_id_marker = None
+
+    while True:
+        params = {"Bucket": bucket, "MaxKeys": 1000}
+        if key_marker:
+            params["KeyMarker"] = key_marker
+        if version_id_marker:
+            params["VersionIdMarker"] = version_id_marker
+
+        response = s3.list_object_versions(**params)
+
+        items = []
+        for obj in response.get("Versions", []):
+            items.append({"Key": obj["Key"], "VersionId": obj["VersionId"]})
+        for marker in response.get("DeleteMarkers", []):
+            items.append({"Key": marker["Key"], "VersionId": marker["VersionId"]})
+
+        if items:
+            if dry_run:
+                deleted += len(items)
+            else:
+                result = s3.delete_objects(
+                    Bucket=bucket,
+                    Delete={"Objects": items, "Quiet": True},
+                )
+                deleted += len(result.get("Deleted", []))
+
+        if not response.get("IsTruncated"):
+            break
+
+        key_marker = response.get("NextKeyMarker")
+        version_id_marker = response.get("NextVersionIdMarker")
+
+    return deleted
+
+
+def abort_multipart_uploads(s3, bucket, dry_run):
+    aborted = 0
+    key_marker = None
+    upload_id_marker = None
+
+    while True:
+        params = {"Bucket": bucket, "MaxUploads": 1000}
+        if key_marker:
+            params["KeyMarker"] = key_marker
+        if upload_id_marker:
+            params["UploadIdMarker"] = upload_id_marker
+
+        response = s3.list_multipart_uploads(**params)
+        uploads = response.get("Uploads", [])
+
+        for upload in uploads:
+            if dry_run:
+                aborted += 1
+            else:
+                s3.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=upload["Key"],
+                    UploadId=upload["UploadId"],
+                )
+                aborted += 1
+
+        if not response.get("IsTruncated"):
+            break
+
+        key_marker = response.get("NextKeyMarker")
+        upload_id_marker = response.get("NextUploadIdMarker")
+
+    return aborted
+
+
+def empty_bucket(s3, bucket, dry_run):
+    print(f"==> Processing bucket: {bucket}")
+
+    versioning = s3.get_bucket_versioning(Bucket=bucket).get("Status", "None")
+    print(f"    Versioning status: {versioning}")
+
+    current_deleted = delete_current_objects(s3, bucket, dry_run)
+    print(f"    Current objects {'to delete' if dry_run else 'deleted'}: {current_deleted}")
+
+    versioned_deleted = 0
+    if versioning in {"Enabled", "Suspended"}:
+        versioned_deleted = delete_versions_and_markers(s3, bucket, dry_run)
+        print(
+            f"    Versions/delete markers {'to delete' if dry_run else 'deleted'}: {versioned_deleted}"
+        )
+
+    aborted = abort_multipart_uploads(s3, bucket, dry_run)
+    print(f"    Multipart uploads {'to abort' if dry_run else 'aborted'}: {aborted}")
+
+
+def main():
+    args = parse_args()
+    s3 = get_s3_client()
+
+    try:
+        buckets = get_matching_buckets(s3, args.suffix)
+
+        if not buckets:
+            print(f"No buckets found ending with: {args.suffix}")
+            return 0
+
+        print("Matched buckets:")
+        for bucket in buckets:
+            print(f" - {bucket}")
+
+        for bucket in buckets:
+            try:
+                empty_bucket(s3, bucket, args.dry_run)
+            except ClientError as e:
+                print(f"ERROR for bucket {bucket}: {e}", file=sys.stderr)
+
+        return 0
+
+    except (ClientError, BotoCoreError) as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
