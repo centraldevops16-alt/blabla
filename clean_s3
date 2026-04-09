@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from datetime import datetime, timedelta, timezone
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+
+DEFAULT_REGION = "us-east-1"
+DEFAULT_DAYS = 30
+BATCH_SIZE = 1000
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Delete S3 objects older than N days from buckets whose name ends with a suffix, including versioned buckets."
+    )
+    parser.add_argument(
+        "--suffix",
+        default="-test-bucket",
+        help="Bucket name suffix to match. Default: -test-bucket",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help="Delete objects older than this many days. Default: 30",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only print counts without deleting.",
+    )
+    return parser.parse_args()
+
+
+def get_s3_client():
+    return boto3.client("s3", region_name=DEFAULT_REGION)
+
+
+def get_matching_buckets(s3, suffix):
+    response = s3.list_buckets()
+    return [b["Name"] for b in response.get("Buckets", []) if b["Name"].endswith(suffix)]
+
+
+def chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def delete_batch(s3, bucket, items, dry_run):
+    if not items:
+        return 0
+
+    if dry_run:
+        return len(items)
+
+    deleted = 0
+    for batch in chunks(items, BATCH_SIZE):
+        result = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": batch, "Quiet": True},
+        )
+        deleted += len(result.get("Deleted", []))
+    return deleted
+
+
+def delete_old_current_objects(s3, bucket, cutoff_time, dry_run):
+    deleted = 0
+    continuation_token = None
+
+    while True:
+        params = {"Bucket": bucket, "MaxKeys": 1000}
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+
+        response = s3.list_objects_v2(**params)
+        contents = response.get("Contents", [])
+
+        to_delete = [
+            {"Key": obj["Key"]}
+            for obj in contents
+            if obj["LastModified"] < cutoff_time
+        ]
+
+        deleted += delete_batch(s3, bucket, to_delete, dry_run)
+
+        if not response.get("IsTruncated"):
+            break
+
+        continuation_token = response.get("NextContinuationToken")
+
+    return deleted
+
+
+def delete_old_versions_and_markers(s3, bucket, cutoff_time, dry_run):
+    deleted_versions = 0
+    deleted_markers = 0
+    key_marker = None
+    version_id_marker = None
+
+    while True:
+        params = {"Bucket": bucket, "MaxKeys": 1000}
+        if key_marker:
+            params["KeyMarker"] = key_marker
+        if version_id_marker:
+            params["VersionIdMarker"] = version_id_marker
+
+        response = s3.list_object_versions(**params)
+
+        old_versions = [
+            {"Key": obj["Key"], "VersionId": obj["VersionId"]}
+            for obj in response.get("Versions", [])
+            if obj["LastModified"] < cutoff_time
+        ]
+
+        old_markers = [
+            {"Key": marker["Key"], "VersionId": marker["VersionId"]}
+            for marker in response.get("DeleteMarkers", [])
+            if marker["LastModified"] < cutoff_time
+        ]
+
+        deleted_versions += delete_batch(s3, bucket, old_versions, dry_run)
+        deleted_markers += delete_batch(s3, bucket, old_markers, dry_run)
+
+        if not response.get("IsTruncated"):
+            break
+
+        key_marker = response.get("NextKeyMarker")
+        version_id_marker = response.get("NextVersionIdMarker")
+
+    return deleted_versions, deleted_markers
+
+
+def process_bucket(s3, bucket, cutoff_time, days, dry_run):
+    print(f"==> Processing bucket: {bucket}")
+
+    versioning = s3.get_bucket_versioning(Bucket=bucket).get("Status", "None")
+    print(f"    Versioning status: {versioning}")
+    print(f"    Cutoff time: {cutoff_time.isoformat()}")
+
+    if versioning in {"Enabled", "Suspended"}:
+        deleted_versions, deleted_markers = delete_old_versions_and_markers(
+            s3, bucket, cutoff_time, dry_run
+        )
+        action = "to delete" if dry_run else "deleted"
+        print(f"    Object versions older than {days} days {action}: {deleted_versions}")
+        print(f"    Delete markers older than {days} days {action}: {deleted_markers}")
+    else:
+        deleted_current = delete_old_current_objects(s3, bucket, cutoff_time, dry_run)
+        action = "to delete" if dry_run else "deleted"
+        print(f"    Current objects older than {days} days {action}: {deleted_current}")
+
+
+def main():
+    args = parse_args()
+    cutoff_time = datetime.now(timezone.utc) - timedelta(days=args.days)
+    s3 = get_s3_client()
+
+    try:
+        buckets = get_matching_buckets(s3, args.suffix)
+
+        if not buckets:
+            print(f"No buckets found ending with: {args.suffix}")
+            return 0
+
+        print("Matched buckets:")
+        for bucket in buckets:
+            print(f" - {bucket}")
+
+        for bucket in buckets:
+            try:
+                process_bucket(s3, bucket, cutoff_time, args.days, args.dry_run)
+            except ClientError as e:
+                print(f"ERROR for bucket {bucket}: {e}", file=sys.stderr)
+
+        return 0
+
+    except (ClientError, BotoCoreError) as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
