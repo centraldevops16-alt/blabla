@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+
+DEFAULT_REGION = "us-east-1"
+DEFAULT_DAYS = 30
+BATCH_SIZE = 1000
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Delete S3 objects older than N days from buckets whose names end with a suffix."
+    )
+    parser.add_argument(
+        "--suffix",
+        default="-test-bucket",
+        help="Bucket suffix to match. Default: -test-bucket",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help="Delete items older than this many days. Default: 30",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan and show what would be deleted without deleting.",
+    )
+    parser.add_argument(
+        "--include-current-versions",
+        action="store_true",
+        help="For versioned buckets, also permanently delete latest/current versions older than cutoff.",
+    )
+    parser.add_argument(
+        "--delete-markers",
+        action="store_true",
+        help="For versioned buckets, also delete old delete markers.",
+    )
+    parser.add_argument(
+        "--prefix",
+        default="",
+        help="Optional prefix filter to reduce scan scope.",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show tqdm progress bar if tqdm is installed.",
+    )
+    return parser.parse_args()
+
+
+def get_s3_client():
+    return boto3.client("s3", region_name=DEFAULT_REGION)
+
+
+def get_matching_buckets(s3, suffix):
+    response = s3.list_buckets()
+    return sorted([b["Name"] for b in response.get("Buckets", []) if b["Name"].endswith(suffix)])
+
+
+def chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def render_status(stats, bucket):
+    return (
+        f"\r[{bucket}] pages={stats['pages']:,} "
+        f"scanned_versions={stats['scanned_versions']:,} "
+        f"scanned_markers={stats['scanned_markers']:,} "
+        f"matched={stats['matched']:,} "
+        f"submitted={stats['submitted']:,} "
+        f"deleted={stats['deleted']:,} "
+        f"errors={stats['errors']:,}"
+    )
+
+
+def delete_batch(s3, bucket, batch, dry_run, stats):
+    if not batch:
+        return
+
+    stats["submitted"] += len(batch)
+
+    if dry_run:
+        stats["deleted"] += len(batch)
+        return
+
+    try:
+        response = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": batch, "Quiet": False},
+        )
+        stats["deleted"] += len(response.get("Deleted", []))
+        stats["errors"] += len(response.get("Errors", []))
+    except ClientError:
+        stats["errors"] += len(batch)
+        raise
+
+
+def process_non_versioned_bucket(s3, bucket, cutoff_time, dry_run, prefix, show_progress):
+    continuation_token = None
+    stats = {
+        "pages": 0,
+        "scanned_versions": 0,
+        "scanned_markers": 0,
+        "matched": 0,
+        "submitted": 0,
+        "deleted": 0,
+        "errors": 0,
+    }
+
+    pbar = tqdm(desc=f"{bucket} objects", unit="obj") if (show_progress and tqdm) else None
+    last_print = 0.0
+
+    while True:
+        params = {"Bucket": bucket, "MaxKeys": 1000}
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+        if prefix:
+            params["Prefix"] = prefix
+
+        response = s3.list_objects_v2(**params)
+        stats["pages"] += 1
+
+        to_delete = []
+        for obj in response.get("Contents", []):
+            stats["scanned_versions"] += 1
+            if pbar:
+                pbar.update(1)
+            if obj["LastModified"] < cutoff_time:
+                stats["matched"] += 1
+                to_delete.append({"Key": obj["Key"]})
+
+        for batch in chunks(to_delete, BATCH_SIZE):
+            delete_batch(s3, bucket, batch, dry_run, stats)
+
+        now = time.time()
+        if not pbar and now - last_print >= 1:
+            sys.stdout.write(render_status(stats, bucket))
+            sys.stdout.flush()
+            last_print = now
+
+        if not response.get("IsTruncated"):
+            break
+        continuation_token = response.get("NextContinuationToken")
+
+    if pbar:
+        pbar.close()
+    if not pbar:
+        sys.stdout.write(render_status(stats, bucket) + "\n")
+    return stats
+
+
+def process_versioned_bucket(
+    s3,
+    bucket,
+    cutoff_time,
+    dry_run,
+    include_current_versions,
+    delete_markers,
+    prefix,
+    show_progress,
+):
+    key_marker = None
+    version_id_marker = None
+    stats = {
+        "pages": 0,
+        "scanned_versions": 0,
+        "scanned_markers": 0,
+        "matched": 0,
+        "submitted": 0,
+        "deleted": 0,
+        "errors": 0,
+    }
+
+    pbar = tqdm(desc=f"{bucket} versions", unit="item") if (show_progress and tqdm) else None
+    last_print = 0.0
+
+    while True:
+        params = {"Bucket": bucket, "MaxKeys": 1000}
+        if key_marker:
+            params["KeyMarker"] = key_marker
+        if version_id_marker:
+            params["VersionIdMarker"] = version_id_marker
+        if prefix:
+            params["Prefix"] = prefix
+
+        response = s3.list_object_versions(**params)
+        stats["pages"] += 1
+
+        to_delete = []
+
+        for version in response.get("Versions", []):
+            stats["scanned_versions"] += 1
+            if pbar:
+                pbar.update(1)
+
+            is_latest = version.get("IsLatest", False)
+            is_old = version["LastModified"] < cutoff_time
+
+            if not is_old:
+                continue
+
+            if is_latest and not include_current_versions:
+                continue
+
+            stats["matched"] += 1
+            to_delete.append(
+                {"Key": version["Key"], "VersionId": version["VersionId"]}
+            )
+
+        if delete_markers:
+            for marker in response.get("DeleteMarkers", []):
+                stats["scanned_markers"] += 1
+                if pbar:
+                    pbar.update(1)
+
+                if marker["LastModified"] < cutoff_time:
+                    stats["matched"] += 1
+                    to_delete.append(
+                        {"Key": marker["Key"], "VersionId": marker["VersionId"]}
+                    )
+        else:
+            for marker in response.get("DeleteMarkers", []):
+                stats["scanned_markers"] += 1
+                if pbar:
+                    pbar.update(1)
+
+        for batch in chunks(to_delete, BATCH_SIZE):
+            delete_batch(s3, bucket, batch, dry_run, stats)
+
+        now = time.time()
+        if not pbar and now - last_print >= 1:
+            sys.stdout.write(render_status(stats, bucket))
+            sys.stdout.flush()
+            last_print = now
+
+        if not response.get("IsTruncated"):
+            break
+
+        key_marker = response.get("NextKeyMarker")
+        version_id_marker = response.get("NextVersionIdMarker")
+
+    if pbar:
+        pbar.close()
+    if not pbar:
+        sys.stdout.write(render_status(stats, bucket) + "\n")
+    return stats
+
+
+def process_bucket(
+    s3,
+    bucket,
+    cutoff_time,
+    dry_run,
+    include_current_versions,
+    delete_markers,
+    prefix,
+    show_progress,
+):
+    print(f"\n==> Processing bucket: {bucket}")
+    print(f"    Cutoff time: {cutoff_time.isoformat()}")
+    if prefix:
+        print(f"    Prefix filter: {prefix}")
+
+    versioning = s3.get_bucket_versioning(Bucket=bucket).get("Status", "None")
+    print(f"    Versioning status: {versioning}")
+
+    if versioning in {"Enabled", "Suspended"}:
+        stats = process_versioned_bucket(
+            s3=s3,
+            bucket=bucket,
+            cutoff_time=cutoff_time,
+            dry_run=dry_run,
+            include_current_versions=include_current_versions,
+            delete_markers=delete_markers,
+            prefix=prefix,
+            show_progress=show_progress,
+        )
+    else:
+        stats = process_non_versioned_bucket(
+            s3=s3,
+            bucket=bucket,
+            cutoff_time=cutoff_time,
+            dry_run=dry_run,
+            prefix=prefix,
+            show_progress=show_progress,
+        )
+
+    print(
+        f"    Final: matched={stats['matched']:,}, "
+        f"submitted={stats['submitted']:,}, "
+        f"deleted={stats['deleted']:,}, "
+        f"errors={stats['errors']:,}"
+    )
+
+
+def main():
+    args = parse_args()
+    cutoff_time = datetime.now(timezone.utc) - timedelta(days=args.days)
+    s3 = get_s3_client()
+
+    try:
+        buckets = get_matching_buckets(s3, args.suffix)
+        if not buckets:
+            print(f"No buckets found ending with: {args.suffix}")
+            return 0
+
+        print("Matched buckets:")
+        for bucket in buckets:
+            print(f" - {bucket}")
+
+        if args.progress and tqdm is None:
+            print("tqdm is not installed; falling back to text counters.", file=sys.stderr)
+
+        for bucket in buckets:
+            try:
+                process_bucket(
+                    s3=s3,
+                    bucket=bucket,
+                    cutoff_time=cutoff_time,
+                    dry_run=args.dry_run,
+                    include_current_versions=args.include_current_versions,
+                    delete_markers=args.delete_markers,
+                    prefix=args.prefix,
+                    show_progress=args.progress,
+                )
+            except (ClientError, BotoCoreError) as e:
+                print(f"\nERROR for bucket {bucket}: {e}", file=sys.stderr)
+
+        return 0
+
+    except (ClientError, BotoCoreError) as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
