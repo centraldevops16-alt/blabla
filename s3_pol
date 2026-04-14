@@ -1,0 +1,967 @@
+Create a SDK script to set intelligent tiering policy to all buckets in a region in AWS account.
+Add option to set the policy for bucket whose name matches specific pattern.
+Completed 2 steps
+Yes — below is a reusable Python SDK script using boto3 that applies an S3 Intelligent-Tiering configuration to every bucket in a target region, with an optional bucket-name pattern filter. The script uses put_bucket_intelligent_tiering_configuration, which supports a configuration ID, optional object prefix filter, and tiering transitions such as ARCHIVE_ACCESS and DEEP_ARCHIVE_ACCESS; AWS also notes that us-east-1 buckets return null as LocationConstraint, and HeadBucket is the preferred way to discover a bucket’s region.
+
+Script
+python
+#!/usr/bin/env python3
+
+import argparse
+import fnmatch
+import sys
+from botocore.exceptions import ClientError
+import boto3
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Apply S3 Intelligent-Tiering configuration to all buckets in a region."
+    )
+    parser.add_argument(
+        "--region",
+        required=True,
+        help="Target AWS region for bucket selection, for example ap-south-1",
+    )
+    parser.add_argument(
+        "--bucket-pattern",
+        default="*",
+        help="Optional shell-style bucket name pattern, for example prod-* or *-logs",
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=None,
+        help="Optional object key prefix filter inside each bucket, for example logs/ or archive/",
+    )
+    parser.add_argument(
+        "--config-id",
+        default="default-intelligent-tiering",
+        help="Intelligent-Tiering configuration ID",
+    )
+    parser.add_argument(
+        "--archive-days",
+        type=int,
+        default=90,
+        help="Days of no access before ARCHIVE_ACCESS, minimum 90",
+    )
+    parser.add_argument(
+        "--deep-archive-days",
+        type=int,
+        default=180,
+        help="Days of no access before DEEP_ARCHIVE_ACCESS, minimum 180",
+    )
+    parser.add_argument(
+        "--expected-bucket-owner",
+        default=None,
+        help="Optional 12-digit AWS account ID for safety",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show matching buckets without applying configuration",
+    )
+    return parser.parse_args()
+
+
+def validate_args(args):
+    if args.archive_days < 90:
+        raise ValueError("--archive-days must be at least 90")
+    if args.deep_archive_days < 180:
+        raise ValueError("--deep-archive-days must be at least 180")
+    if args.deep_archive_days <= args.archive_days:
+        raise ValueError("--deep-archive-days must be greater than --archive-days")
+
+
+def get_bucket_region(s3_client, bucket_name, expected_owner=None):
+    params = {"Bucket": bucket_name}
+    if expected_owner:
+        params["ExpectedBucketOwner"] = expected_owner
+
+    response = s3_client.get_bucket_location(**params)
+    location = response.get("LocationConstraint")
+
+    if location is None:
+        return "us-east-1"
+    if location == "EU":
+        return "eu-west-1"
+    return location
+
+
+def build_tiering_config(config_id, archive_days, deep_archive_days, object_prefix=None):
+    config = {
+        "Id": config_id,
+        "Status": "Enabled",
+        "Tierings": [
+            {
+                "Days": archive_days,
+                "AccessTier": "ARCHIVE_ACCESS",
+            },
+            {
+                "Days": deep_archive_days,
+                "AccessTier": "DEEP_ARCHIVE_ACCESS",
+            },
+        ],
+    }
+
+    if object_prefix:
+        config["Filter"] = {"Prefix": object_prefix}
+
+    return config
+
+
+def apply_policy_to_bucket(s3_client, bucket_name, config_id, config, expected_owner=None):
+    params = {
+        "Bucket": bucket_name,
+        "Id": config_id,
+        "IntelligentTieringConfiguration": config,
+    }
+    if expected_owner:
+        params["ExpectedBucketOwner"] = expected_owner
+
+    s3_client.put_bucket_intelligent_tiering_configuration(**params)
+
+
+def main():
+    args = parse_args()
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        print(f"Argument error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    s3 = boto3.client("s3")
+
+    try:
+        buckets = s3.list_buckets()["Buckets"]
+    except ClientError as exc:
+        print(f"Failed to list buckets: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    matched_buckets = []
+    skipped_buckets = []
+
+    for bucket in buckets:
+        bucket_name = bucket["Name"]
+
+        if not fnmatch.fnmatch(bucket_name, args.bucket_pattern):
+            continue
+
+        try:
+            bucket_region = get_bucket_region(
+                s3, bucket_name, expected_owner=args.expected_bucket_owner
+            )
+        except ClientError as exc:
+            skipped_buckets.append((bucket_name, f"region lookup failed: {exc}"))
+            continue
+
+        if bucket_region != args.region:
+            continue
+
+        matched_buckets.append(bucket_name)
+
+    if not matched_buckets:
+        print("No buckets matched the given criteria.")
+        if skipped_buckets:
+            print("\nSkipped buckets:")
+            for name, reason in skipped_buckets:
+                print(f"  - {name}: {reason}")
+        return
+
+    config = build_tiering_config(
+        config_id=args.config_id,
+        archive_days=args.archive_days,
+        deep_archive_days=args.deep_archive_days,
+        object_prefix=args.object_prefix,
+    )
+
+    print("Matched buckets:")
+    for bucket_name in matched_buckets:
+        print(f"  - {bucket_name}")
+
+    if args.dry_run:
+        print("\nDry run enabled. No changes were made.")
+        return
+
+    print("\nApplying Intelligent-Tiering configuration...")
+    success = []
+    failed = []
+
+    for bucket_name in matched_buckets:
+        try:
+            apply_policy_to_bucket(
+                s3_client=s3,
+                bucket_name=bucket_name,
+                config_id=args.config_id,
+                config=config,
+                expected_owner=args.expected_bucket_owner,
+            )
+            success.append(bucket_name)
+            print(f"[OK] {bucket_name}")
+        except ClientError as exc:
+            failed.append((bucket_name, str(exc)))
+            print(f"[FAILED] {bucket_name}: {exc}")
+
+    print("\nCompleted.")
+    print(f"Successful: {len(success)}")
+    print(f"Failed: {len(failed)}")
+
+    if failed:
+        print("\nFailures:")
+        for bucket_name, error in failed:
+            print(f"  - {bucket_name}: {error}")
+
+    if skipped_buckets:
+        print("\nSkipped during discovery:")
+        for bucket_name, reason in skipped_buckets:
+            print(f"  - {bucket_name}: {reason}")
+
+
+if __name__ == "__main__":
+    main()
+What it does
+This script lists all buckets in the account, resolves each bucket’s region, filters buckets to the region you pass with --region, and optionally narrows the selection with a shell-style name match such as prod-* or *-logs. It then applies put_bucket_intelligent_tiering_configuration with a rule ID, Status, and Tierings, and if you pass --object-prefix, it adds the supported Filter: {Prefix: ...} so the rule applies only to matching object keys within each bucket.
+
+Example usage
+Apply to all buckets in ap-south-1:
+
+bash
+python s3_intelligent_tiering_bulk.py --region ap-south-1
+Apply only to buckets whose names start with prod-:
+
+bash
+python s3_intelligent_tiering_bulk.py --region ap-south-1 --bucket-pattern "prod-*"
+Apply only to matching buckets and only for objects under logs/:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-pattern "prod-*" \
+  --object-prefix "logs/"
+Preview matching buckets without changes:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-pattern "*-logs" \
+  --dry-run
+Required permissions
+The caller needs permission to list buckets and discover their location, and AWS documents that setting the configuration requires s3:PutIntelligentTieringConfiguration on the bucket.
+
+A minimal starting point is:
+
+json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListAllBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BucketLocationAndTiering",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:PutIntelligentTieringConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::*"
+    }
+  ]
+}
+Important note
+This API configures archive behavior for objects already stored in the S3 Intelligent-Tiering storage class; AWS notes you only need this bucket configuration if you want objects in that storage class to move into Archive Access or Deep Archive Access tiers automatically.
+
+If you want, I can also give you:
+
+an AWS CLI version,
+
+a version with regex instead of wildcard matching,
+
+or a version that assumes role across multiple accounts.
+
+Update the policy to incorporate a set of bucket patterns
+
+Yes — update the script so --bucket-pattern accepts multiple values, because Python’s fnmatch works on one pattern at a time and is commonly combined across a list of patterns in code.
+
+Updated arguments
+Change the argument from a single string to a list using nargs="+", so you can pass one or more shell-style patterns like prod-*, *-logs, or data-*.
+
+python
+parser.add_argument(
+    "--bucket-patterns",
+    nargs="+",
+    default=["*"],
+    help='One or more shell-style bucket name patterns, for example "prod-*" "*-logs" "data-*"',
+)
+Updated matching logic
+Replace the single-pattern check with any(...), so a bucket is selected if its name matches at least one supplied pattern.
+
+python
+def bucket_matches_patterns(bucket_name, patterns):
+    return any(fnmatch.fnmatch(bucket_name, pattern) for pattern in patterns)
+Then replace:
+
+python
+if not fnmatch.fnmatch(bucket_name, args.bucket_pattern):
+    continue
+with:
+
+python
+if not bucket_matches_patterns(bucket_name, args.bucket_patterns):
+    continue
+Full updated script
+This version keeps the same Intelligent-Tiering API behavior and filter support, while adding support for a set of bucket patterns. AWS documents that the Intelligent-Tiering configuration can include an optional Filter and required Tierings, with ARCHIVE_ACCESS requiring at least 90 days and DEEP_ARCHIVE_ACCESS requiring at least 180 days.
+
+python
+#!/usr/bin/env python3
+
+import argparse
+import fnmatch
+import sys
+from botocore.exceptions import ClientError
+import boto3
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Apply S3 Intelligent-Tiering configuration to all buckets in a region."
+    )
+    parser.add_argument(
+        "--region",
+        required=True,
+        help="Target AWS region for bucket selection, for example ap-south-1",
+    )
+    parser.add_argument(
+        "--bucket-patterns",
+        nargs="+",
+        default=["*"],
+        help='One or more shell-style bucket name patterns, for example "prod-*" "*-logs" "data-*"',
+    )
+    parser.add_argument(
+        "--object-prefix",
+        default=None,
+        help="Optional object key prefix filter inside each bucket, for example logs/ or archive/",
+    )
+    parser.add_argument(
+        "--config-id",
+        default="default-intelligent-tiering",
+        help="Intelligent-Tiering configuration ID",
+    )
+    parser.add_argument(
+        "--archive-days",
+        type=int,
+        default=90,
+        help="Days of no access before ARCHIVE_ACCESS, minimum 90",
+    )
+    parser.add_argument(
+        "--deep-archive-days",
+        type=int,
+        default=180,
+        help="Days of no access before DEEP_ARCHIVE_ACCESS, minimum 180",
+    )
+    parser.add_argument(
+        "--expected-bucket-owner",
+        default=None,
+        help="Optional 12-digit AWS account ID for safety",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show matching buckets without applying configuration",
+    )
+    return parser.parse_args()
+
+
+def validate_args(args):
+    if args.archive_days < 90:
+        raise ValueError("--archive-days must be at least 90")
+    if args.deep_archive_days < 180:
+        raise ValueError("--deep-archive-days must be at least 180")
+    if args.deep_archive_days <= args.archive_days:
+        raise ValueError("--deep-archive-days must be greater than --archive-days")
+
+
+def bucket_matches_patterns(bucket_name, patterns):
+    return any(fnmatch.fnmatch(bucket_name, pattern) for pattern in patterns)
+
+
+def get_bucket_region(s3_client, bucket_name, expected_owner=None):
+    params = {"Bucket": bucket_name}
+    if expected_owner:
+        params["ExpectedBucketOwner"] = expected_owner
+
+    response = s3_client.get_bucket_location(**params)
+    location = response.get("LocationConstraint")
+
+    if location is None:
+        return "us-east-1"
+    if location == "EU":
+        return "eu-west-1"
+    return location
+
+
+def build_tiering_config(config_id, archive_days, deep_archive_days, object_prefix=None):
+    config = {
+        "Id": config_id,
+        "Status": "Enabled",
+        "Tierings": [
+            {
+                "Days": archive_days,
+                "AccessTier": "ARCHIVE_ACCESS",
+            },
+            {
+                "Days": deep_archive_days,
+                "AccessTier": "DEEP_ARCHIVE_ACCESS",
+            },
+        ],
+    }
+
+    if object_prefix:
+        config["Filter"] = {"Prefix": object_prefix}
+
+    return config
+
+
+def apply_policy_to_bucket(s3_client, bucket_name, config_id, config, expected_owner=None):
+    params = {
+        "Bucket": bucket_name,
+        "Id": config_id,
+        "IntelligentTieringConfiguration": config,
+    }
+    if expected_owner:
+        params["ExpectedBucketOwner"] = expected_owner
+
+    s3_client.put_bucket_intelligent_tiering_configuration(**params)
+
+
+def main():
+    args = parse_args()
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        print(f"Argument error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    s3 = boto3.client("s3")
+
+    try:
+        buckets = s3.list_buckets()["Buckets"]
+    except ClientError as exc:
+        print(f"Failed to list buckets: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    matched_buckets = []
+    skipped_buckets = []
+
+    for bucket in buckets:
+        bucket_name = bucket["Name"]
+
+        if not bucket_matches_patterns(bucket_name, args.bucket_patterns):
+            continue
+
+        try:
+            bucket_region = get_bucket_region(
+                s3, bucket_name, expected_owner=args.expected_bucket_owner
+            )
+        except ClientError as exc:
+            skipped_buckets.append((bucket_name, f"region lookup failed: {exc}"))
+            continue
+
+        if bucket_region != args.region:
+            continue
+
+        matched_buckets.append(bucket_name)
+
+    if not matched_buckets:
+        print("No buckets matched the given criteria.")
+        if skipped_buckets:
+            print("\nSkipped buckets:")
+            for name, reason in skipped_buckets:
+                print(f"  - {name}: {reason}")
+        return
+
+    config = build_tiering_config(
+        config_id=args.config_id,
+        archive_days=args.archive_days,
+        deep_archive_days=args.deep_archive_days,
+        object_prefix=args.object_prefix,
+    )
+
+    print("Bucket patterns:", ", ".join(args.bucket_patterns))
+    print("Matched buckets:")
+    for bucket_name in matched_buckets:
+        print(f"  - {bucket_name}")
+
+    if args.dry_run:
+        print("\nDry run enabled. No changes were made.")
+        return
+
+    print("\nApplying Intelligent-Tiering configuration...")
+    success = []
+    failed = []
+
+    for bucket_name in matched_buckets:
+        try:
+            apply_policy_to_bucket(
+                s3_client=s3,
+                bucket_name=bucket_name,
+                config_id=args.config_id,
+                config=config,
+                expected_owner=args.expected_bucket_owner,
+            )
+            success.append(bucket_name)
+            print(f"[OK] {bucket_name}")
+        except ClientError as exc:
+            failed.append((bucket_name, str(exc)))
+            print(f"[FAILED] {bucket_name}: {exc}")
+
+    print("\nCompleted.")
+    print(f"Successful: {len(success)}")
+    print(f"Failed: {len(failed)}")
+
+    if failed:
+        print("\nFailures:")
+        for bucket_name, error in failed:
+            print(f"  - {bucket_name}: {error}")
+
+    if skipped_buckets:
+        print("\nSkipped during discovery:")
+        for bucket_name, reason in skipped_buckets:
+            print(f"  - {bucket_name}: {reason}")
+
+
+if __name__ == "__main__":
+    main()
+Usage examples
+You can now pass a set of patterns in one command, and any bucket matching one of them will be included.
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-patterns "prod-*" "*-logs" "data-*"
+With object prefix filter:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-patterns "prod-*" "*-archive" \
+  --object-prefix "logs/"
+Dry run first:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-patterns "prod-*" "*-logs" \
+  --dry-run
+Optional enhancement
+If you want, I can make it even cleaner by supporting:
+
+comma-separated patterns like --bucket-patterns prod-*,*-logs,data-*,
+
+regex matching instead of wildcard matching,
+
+or exclude patterns such as --exclude-patterns "*-tmp" "*-backup".
+
+Update the script to set a custom policy
+
+Yes — the cleanest way to support a custom policy is to let the script accept either a JSON string or a JSON file and pass that structure directly as the IntelligentTieringConfiguration. AWS’s boto3 API supports a custom configuration object with Id, Status, optional Filter using Prefix, Tag, or And, and Tierings containing ARCHIVE_ACCESS and DEEP_ARCHIVE_ACCESS; AWS also documents the minimum days as 90 and 180 respectively, with a maximum of 730 days.
+
+Recommended approach
+Instead of hardcoding archive_days, deep_archive_days, and object_prefix, make the script accept:
+
+--policy-file policy.json, or
+
+--policy-json '{"Id":"...","Status":"Enabled",...}'
+
+That makes the script flexible enough for:
+
+prefix-only policies,
+
+tag-based policies,
+
+prefix-and-tag policies,
+
+enabled or disabled configs,
+
+and different tiering day values within AWS limits.
+
+Updated script
+This version keeps the region filter and multiple bucket patterns, but replaces the fixed policy builder with a custom policy loader. The script validates required fields before calling put_bucket_intelligent_tiering_configuration.
+
+python
+#!/usr/bin/env python3
+
+import argparse
+import fnmatch
+import json
+import sys
+
+import boto3
+from botocore.exceptions import ClientError
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Apply a custom S3 Intelligent-Tiering configuration to buckets in a region."
+    )
+    parser.add_argument(
+        "--region",
+        required=True,
+        help="Target AWS region for bucket selection, for example ap-south-1",
+    )
+    parser.add_argument(
+        "--bucket-patterns",
+        nargs="+",
+        default=["*"],
+        help='One or more shell-style bucket name patterns, for example "prod-*" "*-logs" "data-*"',
+    )
+    parser.add_argument(
+        "--policy-file",
+        help="Path to a JSON file containing the Intelligent-Tiering configuration",
+    )
+    parser.add_argument(
+        "--policy-json",
+        help='Inline JSON string for the Intelligent-Tiering configuration',
+    )
+    parser.add_argument(
+        "--expected-bucket-owner",
+        default=None,
+        help="Optional 12-digit AWS account ID for safety",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show matching buckets and validated policy without applying configuration",
+    )
+    return parser.parse_args()
+
+
+def bucket_matches_patterns(bucket_name, patterns):
+    return any(fnmatch.fnmatch(bucket_name, pattern) for pattern in patterns)
+
+
+def get_bucket_region(s3_client, bucket_name, expected_owner=None):
+    params = {"Bucket": bucket_name}
+    if expected_owner:
+        params["ExpectedBucketOwner"] = expected_owner
+
+    response = s3_client.get_bucket_location(**params)
+    location = response.get("LocationConstraint")
+
+    if location is None:
+        return "us-east-1"
+    if location == "EU":
+        return "eu-west-1"
+    return location
+
+
+def load_policy(args):
+    if bool(args.policy_file) == bool(args.policy_json):
+        raise ValueError("Provide exactly one of --policy-file or --policy-json")
+
+    if args.policy_file:
+        with open(args.policy_file, "r", encoding="utf-8") as f:
+            policy = json.load(f)
+    else:
+        policy = json.loads(args.policy_json)
+
+    return policy
+
+
+def validate_policy(policy):
+    if not isinstance(policy, dict):
+        raise ValueError("Policy must be a JSON object")
+
+    required_top_level = ["Id", "Status", "Tierings"]
+    for field in required_top_level:
+        if field not in policy:
+            raise ValueError(f"Policy missing required field: {field}")
+
+    if policy["Status"] not in ("Enabled", "Disabled"):
+        raise ValueError("Policy Status must be Enabled or Disabled")
+
+    if not isinstance(policy["Tierings"], list) or not policy["Tierings"]:
+        raise ValueError("Policy Tierings must be a non-empty list")
+
+    valid_tiers = {"ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"}
+
+    for tier in policy["Tierings"]:
+        if "AccessTier" not in tier or "Days" not in tier:
+            raise ValueError("Each tiering entry must include AccessTier and Days")
+
+        if tier["AccessTier"] not in valid_tiers:
+            raise ValueError(
+                f"Invalid AccessTier: {tier['AccessTier']}. "
+                "Allowed values: ARCHIVE_ACCESS, DEEP_ARCHIVE_ACCESS"
+            )
+
+        if not isinstance(tier["Days"], int):
+            raise ValueError("Tiering Days must be an integer")
+
+        if tier["AccessTier"] == "ARCHIVE_ACCESS":
+            if tier["Days"] < 90 or tier["Days"] > 730:
+                raise ValueError("ARCHIVE_ACCESS Days must be between 90 and 730")
+
+        if tier["AccessTier"] == "DEEP_ARCHIVE_ACCESS":
+            if tier["Days"] < 180 or tier["Days"] > 730:
+                raise ValueError("DEEP_ARCHIVE_ACCESS Days must be between 180 and 730")
+
+    archive_days = next(
+        (t["Days"] for t in policy["Tierings"] if t["AccessTier"] == "ARCHIVE_ACCESS"),
+        None,
+    )
+    deep_archive_days = next(
+        (t["Days"] for t in policy["Tierings"] if t["AccessTier"] == "DEEP_ARCHIVE_ACCESS"),
+        None,
+    )
+
+    if archive_days is not None and deep_archive_days is not None:
+        if deep_archive_days <= archive_days:
+            raise ValueError("DEEP_ARCHIVE_ACCESS Days must be greater than ARCHIVE_ACCESS Days")
+
+    if "Filter" in policy:
+        filter_obj = policy["Filter"]
+        if not isinstance(filter_obj, dict):
+            raise ValueError("Filter must be a JSON object")
+
+        allowed_filter_keys = {"Prefix", "Tag", "And"}
+        unknown_keys = set(filter_obj.keys()) - allowed_filter_keys
+        if unknown_keys:
+            raise ValueError(f"Unsupported Filter keys: {sorted(unknown_keys)}")
+
+    return policy["Id"]
+
+
+def apply_policy_to_bucket(s3_client, bucket_name, config_id, policy, expected_owner=None):
+    params = {
+        "Bucket": bucket_name,
+        "Id": config_id,
+        "IntelligentTieringConfiguration": policy,
+    }
+    if expected_owner:
+        params["ExpectedBucketOwner"] = expected_owner
+
+    s3_client.put_bucket_intelligent_tiering_configuration(**params)
+
+
+def main():
+    args = parse_args()
+
+    try:
+        policy = load_policy(args)
+        config_id = validate_policy(policy)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Policy error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    s3 = boto3.client("s3")
+
+    try:
+        buckets = s3.list_buckets()["Buckets"]
+    except ClientError as exc:
+        print(f"Failed to list buckets: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    matched_buckets = []
+    skipped_buckets = []
+
+    for bucket in buckets:
+        bucket_name = bucket["Name"]
+
+        if not bucket_matches_patterns(bucket_name, args.bucket_patterns):
+            continue
+
+        try:
+            bucket_region = get_bucket_region(
+                s3, bucket_name, expected_owner=args.expected_bucket_owner
+            )
+        except ClientError as exc:
+            skipped_buckets.append((bucket_name, f"region lookup failed: {exc}"))
+            continue
+
+        if bucket_region != args.region:
+            continue
+
+        matched_buckets.append(bucket_name)
+
+    if not matched_buckets:
+        print("No buckets matched the given criteria.")
+        if skipped_buckets:
+            print("\nSkipped buckets:")
+            for name, reason in skipped_buckets:
+                print(f"  - {name}: {reason}")
+        return
+
+    print("Bucket patterns:", ", ".join(args.bucket_patterns))
+    print("Policy ID:", config_id)
+    print("Matched buckets:")
+    for bucket_name in matched_buckets:
+        print(f"  - {bucket_name}")
+
+    if args.dry_run:
+        print("\nValidated policy:")
+        print(json.dumps(policy, indent=2))
+        print("\nDry run enabled. No changes were made.")
+        return
+
+    print("\nApplying Intelligent-Tiering configuration...")
+    success = []
+    failed = []
+
+    for bucket_name in matched_buckets:
+        try:
+            apply_policy_to_bucket(
+                s3_client=s3,
+                bucket_name=bucket_name,
+                config_id=config_id,
+                policy=policy,
+                expected_owner=args.expected_bucket_owner,
+            )
+            success.append(bucket_name)
+            print(f"[OK] {bucket_name}")
+        except ClientError as exc:
+            failed.append((bucket_name, str(exc)))
+            print(f"[FAILED] {bucket_name}: {exc}")
+
+    print("\nCompleted.")
+    print(f"Successful: {len(success)}")
+    print(f"Failed: {len(failed)}")
+
+    if failed:
+        print("\nFailures:")
+        for bucket_name, error in failed:
+            print(f"  - {bucket_name}: {error}")
+
+    if skipped_buckets:
+        print("\nSkipped during discovery:")
+        for bucket_name, reason in skipped_buckets:
+            print(f"  - {bucket_name}: {reason}")
+
+
+if __name__ == "__main__":
+    main()
+Example policy file
+A valid custom policy can include a prefix filter and both archive tiers, because boto3 supports Filter with Prefix, Tag, or And, plus the Tierings list.
+
+json
+{
+  "Id": "custom-logs-tiering",
+  "Status": "Enabled",
+  "Filter": {
+    "Prefix": "logs/"
+  },
+  "Tierings": [
+    {
+      "AccessTier": "ARCHIVE_ACCESS",
+      "Days": 120
+    },
+    {
+      "AccessTier": "DEEP_ARCHIVE_ACCESS",
+      "Days": 210
+    }
+  ]
+}
+Tag-based example
+AWS also supports a tag-based filter in the same policy structure.
+
+json
+{
+  "Id": "tag-based-tiering",
+  "Status": "Enabled",
+  "Filter": {
+    "Tag": {
+      "Key": "archive",
+      "Value": "true"
+    }
+  },
+  "Tierings": [
+    {
+      "AccessTier": "ARCHIVE_ACCESS",
+      "Days": 90
+    },
+    {
+      "AccessTier": "DEEP_ARCHIVE_ACCESS",
+      "Days": 180
+    }
+  ]
+}
+Prefix and tag together
+AWS’s Filter.And form lets you require both a prefix and one or more tags.
+
+json
+{
+  "Id": "raw-data-tiering",
+  "Status": "Enabled",
+  "Filter": {
+    "And": {
+      "Prefix": "raw/",
+      "Tags": [
+        {
+          "Key": "dataset",
+          "Value": "cold"
+        }
+      ]
+    }
+  },
+  "Tierings": [
+    {
+      "AccessTier": "ARCHIVE_ACCESS",
+      "Days": 90
+    },
+    {
+      "AccessTier": "DEEP_ARCHIVE_ACCESS",
+      "Days": 180
+    }
+  ]
+}
+Usage examples
+Use a policy file:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-patterns "prod-*" "*-logs" \
+  --policy-file policy.json
+Use inline JSON:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-patterns "prod-*" \
+  --policy-json '{"Id":"custom-tiering","Status":"Enabled","Tierings":[{"AccessTier":"ARCHIVE_ACCESS","Days":90},{"AccessTier":"DEEP_ARCHIVE_ACCESS","Days":180}]}'
+Dry run first:
+
+bash
+python s3_intelligent_tiering_bulk.py \
+  --region ap-south-1 \
+  --bucket-patterns "prod-*" "*-logs" \
+  --policy-file policy.json \
+  --dry-run
+Practical note
+The policy is sent as-is to put_bucket_intelligent_tiering_configuration, so if you reuse the same Id, the configuration is updated for each bucket with that ID rather than creating a different rule shape in the script itself. AWS also documents a limit of up to 1,000 Intelligent-Tiering configurations per bucket.
+
+If you want, I can next update this into:
+
+a production-ready version with logging and retry/backoff,
+
+a cross-account assume-role version,
+
+or a version that first checks whether the same policy already exists before updating.
+
+Follow-ups
+
+How to add exponential backoff to boto3 API calls
+
+How to implement a check for existing Intelligent-Tiering configs
+
+Comparing prefix versus tag-based filter performance in S3
+
+Managing multiple AWS account credentials via AssumeRole in Boto3
+
+Logging strategies for batch AWS resource configuration tasks
