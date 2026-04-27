@@ -1,0 +1,332 @@
+
+Rewrite the buildspec.yaml
+
+Yes — here is a cleaned and safer buildspec.yml for your CodeBuild job. It uses version: 0.2, supports bash shell syntax, allows runtime selection with runtime-versions, and uses standard artifacts output so logs can be collected after the run.
+
+Rewritten buildspec
+This version fixes the shell condition syntax, uses python3, handles empty SOURCE_PREFIX cleanly, and passes worker values to the script.
+
+text
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    BUCKET: ""
+    SOURCE_PREFIX: ""
+    DRY_RUN: "true"
+    PHASE: "all"
+    RESTORE_DAYS: "7"
+    RESTORE_TIER: "Standard"
+    POLL_SECONDS: "300"
+    BUCKET_WORKERS: "4"
+    OBJECT_WORKERS: "32"
+    SCRIPT_S3_URI: "s3://ops-alerting-bucket/s3_restore/restore_v2.py"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - set -euo pipefail
+      - echo "Installing dependencies..."
+      - python3 --version
+      - pip3 install --no-cache-dir boto3 requests
+
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - echo "Downloading script from S3..."
+      - aws s3 cp "${SCRIPT_S3_URI}" ./restore_v2.py
+      - chmod +x ./restore_v2.py
+      - mkdir -p logs
+      - echo "Bucket             : ${BUCKET}"
+      - echo "Source Prefix      : ${SOURCE_PREFIX}"
+      - echo "Dry Run            : ${DRY_RUN}"
+      - echo "Phase              : ${PHASE}"
+      - echo "Restore Tier       : ${RESTORE_TIER}"
+      - echo "Restore Days       : ${RESTORE_DAYS}"
+      - echo "Poll Seconds       : ${POLL_SECONDS}"
+      - echo "Bucket Workers     : ${BUCKET_WORKERS}"
+      - echo "Object Workers     : ${OBJECT_WORKERS}"
+
+  build:
+    commands:
+      - set -euo pipefail
+      - |
+        CMD="python3 ./restore_v2.py --bucket \"${BUCKET}\" --phase \"${PHASE}\" --tier \"${RESTORE_TIER}\" --days \"${RESTORE_DAYS}\" --poll-seconds \"${POLL_SECONDS}\" --bucket-workers \"${BUCKET_WORKERS}\" --object-workers \"${OBJECT_WORKERS}\" --output-dir logs"
+
+        if [ -n "${SOURCE_PREFIX}" ]; then
+          CMD="${CMD} --source-prefix \"${SOURCE_PREFIX}\""
+        fi
+
+        if [ "${DRY_RUN}" = "true" ] || [ "${DRY_RUN}" = "True" ]; then
+          CMD="${CMD} --dry-run"
+        else
+          CMD="${CMD} --wait"
+        fi
+
+        echo "Executing command:"
+        echo "${CMD}"
+        eval "${CMD}"
+
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Generated files:"
+      - ls -R logs || true
+
+artifacts:
+  files:
+    - logs/**/*
+    - restore_v2.py
+  discard-paths: no
+What this fixes
+Your screenshot showed malformed if tests, including missing spaces before ] and combined conditions inside one bracket expression, which is why the build likely failed in CodeBuild shell execution. This rewritten version uses bash explicitly and builds one command string safely based on whether SOURCE_PREFIX is empty and whether DRY_RUN is true.
+
+Important note
+If your actual Python file is the multi-bucket version, this buildspec should call the matching arguments only. The version above assumes restore_v2.py supports --bucket-workers and --object-workers; if you are still using the single-bucket script, those options will fail and should be removed.
+
+If you want bucket-wide mode
+To process the whole bucket, just leave:
+
+text
+SOURCE_PREFIX: ""
+The buildspec will then omit --source-prefix, which is the correct behavior for the updated script that handles whole-bucket processing.
+
+If you want, I can also give you:
+
+a multi-bucket CodeBuild buildspec using --buckets or --all-buckets-in-region, or
+
+a version that uploads logs to a separate S3 path after completion.
+
+Attached is the script it runs which is single bucket only
+
+s3_glacier_to_ia_refined_v2.py
+
+Got it — since your attached script is single-bucket only, the buildspec should use --max-workers and not --bucket-workers / --object-workers. The script’s argparse shows it accepts --bucket, optional --source-prefix, --phase, --wait, --poll-seconds, --max-workers, --dry-run, and --output-dir, so passing multi-bucket flags would fail immediately.
+
+Correct buildspec.yaml
+This version matches your attached s3_glacier_to_ia_refined_v2.py exactly and also fixes the shell logic issue seen in your screenshot.
+
+text
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    BUCKET: ""
+    SOURCE_PREFIX: ""
+    DRY_RUN: "true"
+    PHASE: "all"
+    RESTORE_DAYS: "7"
+    RESTORE_TIER: "Standard"
+    POLL_SECONDS: "300"
+    MAX_WORKERS: "16"
+    SCRIPT_S3_URI: "s3://ops-alerting-bucket/s3_restore/s3_glacier_to_ia_refined_v2.py"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - set -euo pipefail
+      - echo "Installing dependencies..."
+      - python3 --version
+      - pip3 install --no-cache-dir boto3
+
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - echo "Downloading script from S3..."
+      - aws s3 cp "${SCRIPT_S3_URI}" ./s3_glacier_to_ia_refined_v2.py
+      - chmod +x ./s3_glacier_to_ia_refined_v2.py
+      - mkdir -p logs
+      - echo "================ Configuration ================"
+      - echo "Bucket         : ${BUCKET}"
+      - echo "Source Prefix  : ${SOURCE_PREFIX}"
+      - echo "Dry Run        : ${DRY_RUN}"
+      - echo "Phase          : ${PHASE}"
+      - echo "Restore Tier   : ${RESTORE_TIER}"
+      - echo "Restore Days   : ${RESTORE_DAYS}"
+      - echo "Poll Seconds   : ${POLL_SECONDS}"
+      - echo "Max Workers    : ${MAX_WORKERS}"
+      - echo "Script         : ${SCRIPT_S3_URI}"
+      - echo "=============================================="
+
+  build:
+    commands:
+      - set -euo pipefail
+      - |
+        CMD="python3 ./s3_glacier_to_ia_refined_v2.py --bucket \"${BUCKET}\" --phase \"${PHASE}\" --tier \"${RESTORE_TIER}\" --days \"${RESTORE_DAYS}\" --poll-seconds \"${POLL_SECONDS}\" --max-workers \"${MAX_WORKERS}\" --output-dir logs"
+
+        if [ -n "${SOURCE_PREFIX}" ]; then
+          CMD="${CMD} --source-prefix \"${SOURCE_PREFIX}\""
+        fi
+
+        if [ "${DRY_RUN}" = "true" ] || [ "${DRY_RUN}" = "True" ]; then
+          CMD="${CMD} --dry-run"
+        else
+          CMD="${CMD} --wait"
+        fi
+
+        echo "Executing command:"
+        echo "${CMD}"
+        eval "${CMD}"
+
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Contents of logs directory:"
+      - ls -R logs || true
+
+artifacts:
+  files:
+    - logs/**/*
+    - s3_glacier_to_ia_refined_v2.py
+  discard-paths: no
+Why this matches your script
+Your attached Python file defines --max-workers and does not define --bucket-workers or --object-workers, so this buildspec uses the right option set. The script also treats omitted --source-prefix as whole-bucket mode, so leaving SOURCE_PREFIX empty is the correct way to process the entire bucket.
+
+Environment variables to set
+For a folder/prefix run:
+
+text
+BUCKET=my-bucket
+SOURCE_PREFIX=archived/
+DRY_RUN=true
+PHASE=all
+RESTORE_DAYS=7
+RESTORE_TIER=Standard
+POLL_SECONDS=300
+MAX_WORKERS=16
+For entire bucket:
+
+text
+BUCKET=my-bucket
+SOURCE_PREFIX=
+DRY_RUN=true
+PHASE=all
+RESTORE_DAYS=7
+RESTORE_TIER=Standard
+POLL_SECONDS=300
+MAX_WORKERS=16
+One more likely issue to watch
+Your earlier screenshot downloaded a certificate file and a differently named script, but your attached Python script does not show any custom certificate handling or requests dependency. That means those extra pre_build steps are probably unnecessary unless your environment forces outbound SSL interception.
+
+If you want, I can also give you:
+
+a CodeBuild spec with IAM role assumptions via the project service role, or
+
+a version that uploads logs/ to a separate S3 prefix after execution.
+
+Remove RESTORE_DAYS, RESTORE_TIER, POLL_SECONDS from the env vars
+
+Yes — you can remove them from env:variables and keep them as fixed values directly in the command block. CodeBuild allows plain-text environment variables to be omitted when values are hardcoded in shell commands instead.
+
+Updated buildspec.yaml
+This version removes RESTORE_DAYS, RESTORE_TIER, and POLL_SECONDS from environment variables and hardcodes:
+
+--days 7
+
+--tier Standard
+
+--poll-seconds 300
+
+text
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    BUCKET: ""
+    SOURCE_PREFIX: ""
+    DRY_RUN: "true"
+    PHASE: "all"
+    MAX_WORKERS: "16"
+    SCRIPT_S3_URI: "s3://ops-alerting-bucket/s3_restore/s3_glacier_to_ia_refined_v2.py"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - set -euo pipefail
+      - echo "Installing dependencies..."
+      - python3 --version
+      - pip3 install --no-cache-dir boto3
+
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - echo "Downloading script from S3..."
+      - aws s3 cp "${SCRIPT_S3_URI}" ./s3_glacier_to_ia_refined_v2.py
+      - chmod +x ./s3_glacier_to_ia_refined_v2.py
+      - mkdir -p logs
+      - echo "================ Configuration ================"
+      - echo "Bucket         : ${BUCKET}"
+      - echo "Source Prefix  : ${SOURCE_PREFIX}"
+      - echo "Dry Run        : ${DRY_RUN}"
+      - echo "Phase          : ${PHASE}"
+      - echo "Max Workers    : ${MAX_WORKERS}"
+      - echo "Script         : ${SCRIPT_S3_URI}"
+      - echo "Restore Tier   : Standard"
+      - echo "Restore Days   : 7"
+      - echo "Poll Seconds   : 300"
+      - echo "=============================================="
+
+  build:
+    commands:
+      - set -euo pipefail
+      - |
+        CMD="python3 ./s3_glacier_to_ia_refined_v2.py --bucket \"${BUCKET}\" --phase \"${PHASE}\" --tier \"Standard\" --days \"7\" --poll-seconds \"300\" --max-workers \"${MAX_WORKERS}\" --output-dir logs"
+
+        if [ -n "${SOURCE_PREFIX}" ]; then
+          CMD="${CMD} --source-prefix \"${SOURCE_PREFIX}\""
+        fi
+
+        if [ "${DRY_RUN}" = "true" ] || [ "${DRY_RUN}" = "True" ]; then
+          CMD="${CMD} --dry-run"
+        else
+          CMD="${CMD} --wait"
+        fi
+
+        echo "Executing command:"
+        echo "${CMD}"
+        eval "${CMD}"
+
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Contents of logs directory:"
+      - ls -R logs || true
+
+artifacts:
+  files:
+    - logs/**/*
+    - s3_glacier_to_ia_refined_v2.py
+  discard-paths: no
+What changed
+Only these variables were removed from env:variables:
+
+RESTORE_DAYS
+
+RESTORE_TIER
+
+POLL_SECONDS
+
+Their values are now directly embedded in the Python command, which is valid because your script supports those flags explicitly and does not require them to come from environment variables.
+
+If you want, I can also simplify this one further by removing PHASE from env vars too and hardcoding --phase all.
+
+Follow-ups
+
+Yes please simplify by removing PHASE and hardcoding to all
+
+No keep PHASE as an environment variable for flexibility
+
+Can I use a parameter store secret for the restore tier instead
+
+How do I pass these hardcoded values dynamically from CLI instead
+
+What is the best way to monitor the execution time of this phase
