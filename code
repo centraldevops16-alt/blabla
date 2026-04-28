@@ -1,0 +1,278 @@
+import os
+import json
+import html
+import logging
+import boto3
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+ses = boto3.client("ses")
+
+SENDER_EMAIL = os.environ["SENDER_EMAIL"]
+RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
+
+
+def format_json_pretty(data):
+    return json.dumps(data, indent=2, default=str)
+
+
+def get_badge_color(value, value_type="default"):
+    value = (value or "").lower()
+
+    if value_type == "status":
+        if value in ["completed", "success", "resolved"]:
+            return "#0f9d58"
+        if value in ["failed", "error"]:
+            return "#d93025"
+        if value in ["in_progress", "running", "pending"]:
+            return "#f9ab00"
+
+    if value_type == "priority":
+        if value in ["p0", "critical", "sev1", "high"]:
+            return "#d93025"
+        if value in ["p1", "medium"]:
+            return "#f9ab00"
+        if value in ["p2", "low"]:
+            return "#188038"
+
+    return "#5f6368"
+
+
+def build_email_from_event(event):
+    detail = event.get("detail", {})
+    metadata = detail.get("metadata", {})
+    data = detail.get("data", {})
+
+    agent_space_id = metadata.get("agent_space_id", "N/A")
+    task_id = metadata.get("task_id", "N/A")
+    execution_id = metadata.get("execution_id", "N/A")
+
+    task_type = data.get("task_type", "N/A")
+    priority = data.get("priority", "N/A")
+    status = data.get("status", "N/A")
+    created_at = data.get("created_at", "N/A")
+    updated_at = data.get("updated_at", "N/A")
+    summary_record_id = data.get("summary_record_id", "N/A")
+
+    region = event.get("region", "N/A")
+    account = event.get("account", "N/A")
+    event_time = event.get("time", "N/A")
+    event_id = event.get("id", "N/A")
+    detail_type = event.get("detail-type", "N/A")
+
+    subject = f"AWS DevOps Agent investigation completed: {task_id}"
+
+    text_body = f"""AWS DevOps Agent investigation has completed.
+
+Event Details
+-------------
+Event Type: {detail_type}
+Event ID: {event_id}
+Account: {account}
+Region: {region}
+Event Time: {event_time}
+
+Investigation Details
+---------------------
+Agent Space ID: {agent_space_id}
+Task ID: {task_id}
+Execution ID: {execution_id}
+Task Type: {task_type}
+Priority: {priority}
+Status: {status}
+Created At: {created_at}
+Updated At: {updated_at}
+Summary Record ID: {summary_record_id}
+
+Note
+----
+AWS DevOps Agent included this summary record reference in the completion event.
+If you need the full markdown summary content, retrieve it from the system that stores or forwards the webhook/event payload, or from the DevOps Agent API in an environment where that API is available.
+
+Raw Event Payload
+-----------------
+{format_json_pretty(event)}
+"""
+
+    escaped_raw_payload = html.escape(format_json_pretty(event))
+    escaped_detail_type = html.escape(str(detail_type))
+    escaped_event_id = html.escape(str(event_id))
+    escaped_account = html.escape(str(account))
+    escaped_region = html.escape(str(region))
+    escaped_event_time = html.escape(str(event_time))
+    escaped_agent_space_id = html.escape(str(agent_space_id))
+    escaped_task_id = html.escape(str(task_id))
+    escaped_execution_id = html.escape(str(execution_id))
+    escaped_task_type = html.escape(str(task_type))
+    escaped_priority = html.escape(str(priority))
+    escaped_status = html.escape(str(status))
+    escaped_created_at = html.escape(str(created_at))
+    escaped_updated_at = html.escape(str(updated_at))
+    escaped_summary_record_id = html.escape(str(summary_record_id))
+
+    status_color = get_badge_color(status, "status")
+    priority_color = get_badge_color(priority, "priority")
+
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>{html.escape(subject)}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f7fb; font-family:Arial, Helvetica, sans-serif; color:#1f2937;">
+  <div style="max-width:800px; margin:0 auto; padding:24px;">
+    
+    <div style="background:linear-gradient(135deg, #0f172a, #1d4ed8); border-radius:16px; padding:28px 32px; color:#ffffff;">
+      <div style="font-size:12px; letter-spacing:0.08em; text-transform:uppercase; opacity:0.85; margin-bottom:8px;">
+        AWS DevOps Agent
+      </div>
+      <h1 style="margin:0; font-size:28px; line-height:1.3;">
+        Investigation Completed
+      </h1>
+      <p style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:#dbeafe;">
+        An AWS DevOps Agent investigation has completed successfully and the event details are included below.
+      </p>
+    </div>
+
+    <div style="background:#ffffff; border-radius:16px; padding:24px 28px; margin-top:20px; border:1px solid #e5e7eb; box-shadow:0 4px 14px rgba(15, 23, 42, 0.06);">
+      <div style="margin-bottom:18px;">
+        <span style="display:inline-block; background:{status_color}; color:#ffffff; font-size:12px; font-weight:bold; padding:6px 10px; border-radius:999px; margin-right:8px;">
+          Status: {escaped_status}
+        </span>
+        <span style="display:inline-block; background:{priority_color}; color:#ffffff; font-size:12px; font-weight:bold; padding:6px 10px; border-radius:999px;">
+          Priority: {escaped_priority}
+        </span>
+      </div>
+
+      <h2 style="font-size:18px; margin:0 0 12px 0; color:#111827;">Event Details</h2>
+      <table style="width:100%; border-collapse:collapse; margin-bottom:24px;">
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; width:180px; color:#374151;">Event Type</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_detail_type}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Event ID</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_event_id}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Account</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_account}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Region</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_region}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; font-weight:bold; color:#374151;">Event Time</td>
+          <td style="padding:10px 0;">{escaped_event_time}</td>
+        </tr>
+      </table>
+
+      <h2 style="font-size:18px; margin:0 0 12px 0; color:#111827;">Investigation Details</h2>
+      <table style="width:100%; border-collapse:collapse; margin-bottom:24px;">
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; width:180px; color:#374151;">Agent Space ID</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_agent_space_id}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Task ID</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_task_id}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Execution ID</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_execution_id}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Task Type</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_task_type}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Created At</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_created_at}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb; font-weight:bold; color:#374151;">Updated At</td>
+          <td style="padding:10px 0; border-bottom:1px solid #e5e7eb;">{escaped_updated_at}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0; font-weight:bold; color:#374151;">Summary Record ID</td>
+          <td style="padding:10px 0;">{escaped_summary_record_id}</td>
+        </tr>
+      </table>
+
+      <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:12px; padding:16px 18px; margin-bottom:24px;">
+        <h3 style="margin:0 0 8px 0; font-size:16px; color:#1d4ed8;">Note</h3>
+        <p style="margin:0; font-size:14px; line-height:1.7; color:#1e3a8a;">
+          AWS DevOps Agent included this summary record reference in the completion event.
+          If you need the full markdown summary content, retrieve it from the system that stores or forwards
+          the webhook/event payload, or from the DevOps Agent API in an environment where that API is available.
+        </p>
+      </div>
+
+      <h2 style="font-size:18px; margin:0 0 12px 0; color:#111827;">Raw Event Payload</h2>
+      <pre style="background:#0f172a; color:#e5e7eb; padding:16px; border-radius:12px; overflow:auto; font-size:12px; line-height:1.6; white-space:pre-wrap; word-break:break-word;">{escaped_raw_payload}</pre>
+    </div>
+
+    <div style="text-align:center; font-size:12px; color:#6b7280; padding:16px 8px;">
+      Generated by AWS Lambda via Amazon SES
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+    return subject, text_body, html_body
+
+
+def send_email(subject, text_body, html_body):
+    response = ses.send_email(
+        Source=SENDER_EMAIL,
+        Destination={"ToAddresses": [RECIPIENT_EMAIL]},
+        Message={
+            "Subject": {"Data": subject, "Charset": "UTF-8"},
+            "Body": {
+                "Text": {"Data": text_body, "Charset": "UTF-8"},
+                "Html": {"Data": html_body, "Charset": "UTF-8"},
+            },
+        },
+    )
+    return response["MessageId"]
+
+
+def lambda_handler(event, context):
+    logger.info("Received event: %s", json.dumps(event))
+
+    detail_type = event.get("detail-type")
+    source = event.get("source")
+
+    if source != "aws.aidevops":
+        raise ValueError(f"Unexpected source: {source}")
+
+    if detail_type != "Investigation Completed":
+        logger.info("Ignoring non-completed event: %s", detail_type)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Event ignored", "detail-type": detail_type})
+        }
+
+    try:
+        subject, text_body, html_body = build_email_from_event(event)
+        message_id = send_email(subject, text_body, html_body)
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Email sent successfully",
+                "messageId": message_id
+            })
+        }
+
+    except ClientError:
+        logger.exception("SES client error")
+        raise
+    except Exception:
+        logger.exception("Unhandled error")
+        raise
